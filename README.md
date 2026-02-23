@@ -43,7 +43,7 @@ A Rust arbitrage bot for [Polymarket](https://polymarket.com) crypto “Up or Do
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 git clone https://github.com/rvenandowsley/Polymarket-crypto-5min-arbitrage-bot.git && cd Polymarket-crypto-5min-arbitrage-bot
 
-# 2. Place license.key in project root, copy and edit .env
+# 2. copy and edit .env
 cp .env.example .env
 # Edit .env: set POLYMARKET_PRIVATE_KEY (required)
 
@@ -74,19 +74,15 @@ cd Polymarket-crypto-5min-arbitrage-bot
 
 Or download and extract the project archive.
 
-### 3. License setup
 
-Place the `license.key` file in the project root（Existing）. The program will not run without a valid license.
-
-
-### 4. Configure environment
+### 3. Configure environment
 
 ```bash
 cp .env.example .env
 # Edit .env and fill in required variables (see Configuration below)
 ```
 
-### 5. Build
+### 4. Build
 
 ```bash
 cargo build --release
