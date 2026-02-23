@@ -36,7 +36,7 @@
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 git clone https://github.com/rvenandowsley/Polymarket-crypto-5min-arbitrage-bot.git && cd Polymarket-crypto-5min-arbitrage-bot
 
-# 2. 将 license.key 放入项目根目录，复制并编辑 .env
+# 2. 复制并编辑 .env
 cp .env.example .env
 # 编辑 .env：设置 POLYMARKET_PRIVATE_KEY（必填）
 
@@ -67,19 +67,14 @@ cd Polymarket-crypto-5min-arbitrage-bot
 
 或下载并解压项目压缩包。
 
-### 3. 配置许可证
-
-将 `license.key` 文件放入项目根目录（已存在）。无有效许可证程序无法运行。
-
-
-### 4. 配置环境变量
+### 3. 配置环境变量
 
 ```bash
 cp .env.example .env
 # 编辑 .env，填写必填变量（见下方配置说明）
 ```
 
-### 5. 构建
+### 4. 构建
 
 ```bash
 cargo build --release
