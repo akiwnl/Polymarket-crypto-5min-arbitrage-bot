@@ -882,9 +882,19 @@ async fn main() -> Result<()> {
                                                 // Execute arbitrage (slippage: down=second, up/flat=first)
                                                 match executor_clone.execute_arbitrage_pair(&opp_clone, &yes_dir_s, &no_dir_s).await {
                                                     Ok(result) => {
+                                                        // FOK skip: neither side filled, release pre-allocated exposure
+                                                        if result.yes_filled == dec!(0) && result.no_filled == dec!(0) && !result.success {
+                                                            let pt = risk_manager_clone.position_tracker();
+                                                            pt.update_exposure_cost(opp_clone.yes_token_id, opp_clone.yes_ask_price, -order_size);
+                                                            pt.update_exposure_cost(opp_clone.no_token_id, opp_clone.no_ask_price, -order_size);
+                                                            info!("📉 Exposure released after FOK skip | size:{} | cost:{:.2} USD",
+                                                                order_size, opp_clone.yes_ask_price * order_size + opp_clone.no_ask_price * order_size);
+                                                            return;
+                                                        }
+
                                                         // Save pair_id first, as result will be moved
                                                         let pair_id = result.pair_id.clone();
-                                                        
+
                                                         // Register with risk manager (pass price info for risk exposure calculation)
                                                         risk_manager_clone.register_order_pair(
                                                             result,
