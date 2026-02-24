@@ -32,13 +32,13 @@ impl ArbitrageDetector {
         }
     }
 
-    /// Select price: use best ask only. Returns (yes_ask, no_ask, size, profit_pct, total_price).
+    /// Select price: use best ask only. Returns (yes_ask, no_ask, order_size, yes_available, no_available, profit_pct, total_price).
     /// In executor: compare which price is higher -> add slippage -> create orders.
     fn find_best_opportunity(
         &self,
         yes_book: &BookUpdate,
         no_book: &BookUpdate,
-    ) -> Option<(Decimal, Decimal, Decimal, Decimal, Decimal)> {
+    ) -> Option<(Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal)> {
         // Last ask is the best ask (lowest sell price)
         let yes_best = yes_book.asks.last()?;
         let no_best = no_book.asks.last()?;
@@ -65,8 +65,12 @@ impl ArbitrageDetector {
             return None;
         }
 
+        // Actual available sizes per side (for illiquidity determination in executor)
+        let yes_available = yes_best.size;
+        let no_available = no_best.size;
+
         let profit_pct = (dec!(1.0) - total_price) * dec!(100.0);
-        Some((yes_price, no_price, final_size, profit_pct, total_price))
+        Some((yes_price, no_price, final_size, yes_available, no_available, profit_pct, total_price))
     }
 
 
@@ -116,7 +120,7 @@ impl ArbitrageDetector {
         market_id: &B256,
     ) -> Option<ArbitrageOpportunity> {
         // Select best ask first; in executor: compare which is higher -> add slippage -> create orders
-        let (yes_ask, no_ask, final_size, net_profit_pct, total_price) =
+        let (yes_ask, no_ask, final_size, yes_available, no_available, net_profit_pct, total_price) =
             self.find_best_opportunity(yes_book, no_book)?;
 
         self.print_orderbook_depth(yes_book, no_book, yes_ask, no_ask, final_size, final_size);
@@ -139,8 +143,8 @@ impl ArbitrageDetector {
             no_ask_price: no_ask,
             total_cost: total_price * final_size,
             profit_percentage: net_profit_pct,
-            yes_size: final_size,
-            no_size: final_size,
+            yes_size: yes_available,
+            no_size: no_available,
         })
     }
 }
