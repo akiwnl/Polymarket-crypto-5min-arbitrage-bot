@@ -92,6 +92,7 @@ async fn run_merge_task(
     private_key: String,
     position_tracker: Arc<PositionTracker>,
     wind_down_in_progress: Arc<AtomicBool>,
+    merged_this_window: Arc<AtomicBool>,
 ) {
     let interval = Duration::from_secs(interval_minutes * 60);
     /// Delay between merges to reduce RPC bursts
@@ -151,6 +152,8 @@ async fn run_merge_task(
                 Ok(tx) => {
                     info!("✅ Merge complete | condition_id={:#x}", condition_id);
                     info!("  📝 tx={}", tx);
+                    // Block further arbitrage in this window after successful merge
+                    merged_this_window.store(true, Ordering::Relaxed);
                     // Merge success: deduct positions and exposure (deduct exposure first to ensure update_exposure_cost reads pre-merge positions)
                     if let Some((yes_token, no_token, merge_amt)) = merge_info.get(&condition_id) {
                         position_tracker.update_exposure_cost(*yes_token, dec!(0), -*merge_amt);
@@ -387,6 +390,9 @@ async fn main() -> Result<()> {
     // Wind-down in progress flag: scheduled merge checks this and skips to avoid competing with wind-down merge
     let wind_down_in_progress = Arc::new(AtomicBool::new(false));
 
+    // Block re-entry after merge in the same window: once a merge succeeds, skip further arbitrage to avoid re-buying into the same market
+    let merged_this_window = Arc::new(AtomicBool::new(false));
+
     // Minimum interval between two arbitrage trades
     const MIN_TRADE_INTERVAL: Duration = Duration::from_secs(3);
     let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> = Arc::new(tokio::sync::Mutex::new(None));
@@ -399,8 +405,9 @@ async fn main() -> Result<()> {
             let private_key = config.private_key.clone();
             let position_tracker = _risk_manager.position_tracker().clone();
             let wind_down_flag = wind_down_in_progress.clone();
+            let merged_flag = merged_this_window.clone();
             tokio::spawn(async move {
-                run_merge_task(merge_interval, proxy, private_key, position_tracker, wind_down_flag).await;
+                run_merge_task(merge_interval, proxy, private_key, position_tracker, wind_down_flag, merged_flag).await;
             });
             info!(
                 interval_minutes = merge_interval,
@@ -442,8 +449,9 @@ async fn main() -> Result<()> {
             _rpc_metrics.record_check(true);
         }
 
-        // New round start: reset risk exposure, accumulate from 0 this round
+        // New round start: reset risk exposure and merge flag, accumulate from 0 this round
         _risk_manager.position_tracker().reset_exposure();
+        merged_this_window.store(false, Ordering::Relaxed);
 
         // Initialize orderbook monitor
         let mut monitor = OrderBookMonitor::new();
@@ -598,6 +606,14 @@ async fn main() -> Result<()> {
                                     let size_floor = (pos.size * dec!(100)).floor() / dec!(100);
                                     if size_floor < dec!(0.01) {
                                         debug!(token_id = %pos.asset, size = %pos.size, "Wind-down: position too small, skipping sell");
+                                        continue;
+                                    }
+                                    // Skip sell if below exchange minimum (5 shares); let position resolve with market
+                                    if size_floor < dec!(5.0) {
+                                        info!(
+                                            "⏭️ Wind-down: skipping sell, size {} below minimum 5 | token_id={:#x}",
+                                            size_floor, pos.asset
+                                        );
                                         continue;
                                     }
                                     if let Err(e) = executor_wd.sell_at_price(pos.asset, wind_down_sell_price, size_floor).await {
@@ -811,6 +827,15 @@ async fn main() -> Result<()> {
                                                     market_display
                                                 );
                                                 continue; // Skip this arbitrage opportunity
+                                            }
+
+                                            // Check if merge already happened this window — skip arbitrage to avoid re-buying
+                                            if merged_this_window.load(Ordering::Relaxed) {
+                                                debug!(
+                                                    "⏭️ Merge already completed this window, skipping arbitrage | market:{}",
+                                                    market_display
+                                                );
+                                                continue;
                                             }
 
                                             // Check trade interval: at least 3 seconds between trades

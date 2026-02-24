@@ -172,7 +172,8 @@ impl TradingExecutor {
         }
     }
 
-    /// Execute arbitrage trade (batch submit YES and NO orders via post_orders; order type configured by arbitrage_order_type, GTD uses gtd_expiration_secs)
+    /// Execute arbitrage trade: illiquid side first (FOK), then liquid side (GTD).
+    /// Illiquid = side with smaller available size. If FOK doesn't fill, skip trade (loss $0).
     /// yes_dir / no_dir: price direction "↑" "↓" "−" or "", used to assign slippage by direction (down=second, up/flat=first)
     pub async fn execute_arbitrage_pair(
         &self,
@@ -182,20 +183,11 @@ impl TradingExecutor {
     ) -> Result<OrderPairResult> {
         // Performance timing: total start
         let total_start = Instant::now();
-        
-        // This log is already printed in main.rs, no need to repeat here
-        let expiry_info = if matches!(self.arbitrage_order_type, OrderType::GTD) {
-            format!("expiry:{}s", self.gtd_expiration_secs)
-        } else {
-            "no expiry".to_string()
-        };
+
         debug!(
             market_id = %opp.market_id,
             profit_pct = %opp.profit_percentage,
-            order_type = %self.arbitrage_order_type,
-            "starting arbitrage trade (batch orders, type:{}, {})",
-            self.arbitrage_order_type,
-            expiry_info
+            "starting arbitrage trade (illiquid FOK → liquid GTD)"
         );
 
         // Calculate actual order size (considering max order limit)
@@ -207,32 +199,44 @@ impl TradingExecutor {
         // Generate order pair ID
         let pair_id = Uuid::new_v4().to_string();
 
-        // Calculate expiration: current time + configured expiration
-        let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
-
         // Slippage by direction: up=first, down/flat=second
         let yes_slippage_apply = self.slippage_for_direction(yes_dir);
         let no_slippage_apply = self.slippage_for_direction(no_dir);
         let yes_price_with_slippage = (opp.yes_ask_price + yes_slippage_apply).min(dec!(1.0));
         let no_price_with_slippage = (opp.no_ask_price + no_slippage_apply).min(dec!(1.0));
-        
+
+        // Determine illiquid side: smaller available size = less liquidity
+        let yes_is_illiquid = opp.yes_size <= opp.no_size;
+        let (illiquid_label, liquid_label) = if yes_is_illiquid { ("YES", "NO") } else { ("NO", "YES") };
+        let (illiquid_token, liquid_token) = if yes_is_illiquid {
+            (yes_token_id, no_token_id)
+        } else {
+            (no_token_id, yes_token_id)
+        };
+        let (illiquid_price, liquid_price) = if yes_is_illiquid {
+            (yes_price_with_slippage, no_price_with_slippage)
+        } else {
+            (no_price_with_slippage, yes_price_with_slippage)
+        };
+        let (illiquid_size, liquid_size) = if yes_is_illiquid {
+            (opp.yes_size, opp.no_size)
+        } else {
+            (opp.no_size, opp.yes_size)
+        };
+
         // Print level selection info (price with slippage)
         info!(
-            "📋 Level | YES {:.4}×{:.2} NO {:.4}×{:.2}",
+            "📋 Level | YES {:.4}×{:.2} NO {:.4}×{:.2} | illiquid:{} (size:{})",
             yes_price_with_slippage, order_size,
-            no_price_with_slippage, order_size
+            no_price_with_slippage, order_size,
+            illiquid_label, illiquid_size
         );
-        
-        let expiry_suffix = if matches!(self.arbitrage_order_type, OrderType::GTD) {
-            format!(" | GTD {}s", self.gtd_expiration_secs)
-        } else {
-            String::new()
-        };
+
         info!(
-            "📤 Order | YES {:.4}→{:.4}×{} NO {:.4}→{:.4}×{} | {}{}",
-            opp.yes_ask_price, yes_price_with_slippage, order_size,
-            opp.no_ask_price, no_price_with_slippage, order_size,
-            self.arbitrage_order_type, expiry_suffix
+            "📤 Order | {} FOK {:.4}×{} → {} GTD {:.4}×{} | expiry:{}s",
+            illiquid_label, illiquid_price, order_size,
+            liquid_label, liquid_price, order_size,
+            self.gtd_expiration_secs
         );
 
         // Pre-order check: both sides must be > $1 (exchange minimum)
@@ -252,12 +256,11 @@ impl TradingExecutor {
         // Dry run: simulate full fill, no actual orders
         if self.dry_run {
             info!(
-                "[DRY RUN] Simulated arbitrage | market:{} | YES price:{:.4} (with slippage:{:.4}) | NO price:{:.4} (with slippage:{:.4}) | size:{} | order type:{}",
+                "[DRY RUN] Simulated arbitrage | market:{} | illiquid:{} FOK {:.4} | liquid:{} GTD {:.4} | size:{}",
                 opp.market_id,
-                opp.yes_ask_price, yes_price_with_slippage,
-                opp.no_ask_price, no_price_with_slippage,
-                order_size,
-                self.arbitrage_order_type
+                illiquid_label, illiquid_price,
+                liquid_label, liquid_price,
+                order_size
             );
             let yes_order_id = format!("dry-run-yes-{}", &pair_id[..8]);
             let no_order_id = format!("dry-run-no-{}", &pair_id[..8]);
@@ -274,240 +277,162 @@ impl TradingExecutor {
         }
 
         let client = self.client.as_ref().unwrap();
-
-        // Performance timing: parallel YES/NO order building start
-        let build_start = Instant::now();
-
-        // Build YES and NO orders in parallel; only set expiration for GTD (SDK requires no expiry for non-GTD)
-        let (yes_order, no_order) = tokio::join!(
-            async {
-                let b = client
-                    .limit_order()
-                    .token_id(yes_token_id)
-                    .side(Side::Buy)
-                    .price(yes_price_with_slippage)
-                    .size(order_size)
-                    .order_type(self.arbitrage_order_type.clone());
-                if matches!(&self.arbitrage_order_type, OrderType::GTD) {
-                    b.expiration(expiration).build().await
-                } else {
-                    b.build().await
-                }
-            },
-            async {
-                let b = client
-                    .limit_order()
-                    .token_id(no_token_id)
-                    .side(Side::Buy)
-                    .price(no_price_with_slippage)
-                    .size(order_size)
-                    .order_type(self.arbitrage_order_type.clone());
-                if matches!(&self.arbitrage_order_type, OrderType::GTD) {
-                    b.expiration(expiration).build().await
-                } else {
-                    b.build().await
-                }
-            }
-        );
-        
-        let yes_order = yes_order?;
-        let no_order = no_order?;
-        let build_elapsed = build_start.elapsed().as_millis();
-
-        // Performance timing: parallel signing start
-        let sign_start = Instant::now();
-        
-        // Create signer
         let signer = LocalSigner::from_str(&self.private_key)?
             .with_chain_id(Some(POLYGON));
-        
-        // Sign YES and NO orders in parallel
-        let (signed_yes_result, signed_no_result) = tokio::join!(
-            client.sign(&signer, yes_order),
-            client.sign(&signer, no_order)
-        );
-        
-        let signed_yes = signed_yes_result?;
-        let signed_no = signed_no_result?;
-        let sign_elapsed = sign_start.elapsed().as_millis();
 
-        // Performance timing: order send start
-        let send_start = Instant::now();
-        
-        // Higher unit price first; parse yes_result/no_result from results in same order after submission
-        let yes_first = yes_price_with_slippage >= no_price_with_slippage;
-        let orders_to_send: Vec<_> = if yes_first {
-            vec![signed_yes, signed_no]
-        } else {
-            vec![signed_no, signed_yes]
-        };
-        let results = match client.post_orders(orders_to_send).await {
-            Ok(results) => {
-                let send_elapsed = send_start.elapsed().as_millis();
-                let total_elapsed = total_start.elapsed().as_millis();
-                
-                info!(
-                    "⏱️ Timing | {} | build {}ms sign {}ms send {}ms total {}ms",
-                    &pair_id[..8], build_elapsed, sign_elapsed, send_elapsed, total_elapsed
-                );
-                
-                results
-            }
+        // ── Step 1: Build, sign, and send illiquid side with FOK ──
+        let step1_start = Instant::now();
+
+        let illiquid_order = client
+            .limit_order()
+            .token_id(illiquid_token)
+            .side(Side::Buy)
+            .price(illiquid_price)
+            .size(order_size)
+            .order_type(OrderType::FOK)
+            .build()
+            .await?;
+
+        let signed_illiquid = client.sign(&signer, illiquid_order).await?;
+
+        let illiquid_results = match client.post_orders(vec![signed_illiquid]).await {
+            Ok(results) => results,
             Err(e) => {
-                let send_elapsed = send_start.elapsed().as_millis();
-                let total_elapsed = total_start.elapsed().as_millis();
-                
+                let elapsed = step1_start.elapsed().as_millis();
                 error!(
-                    "❌ Batch order API call failed | pair ID:{} | YES price:{} (with slippage) | NO price:{} (with slippage) | size:{} | build:{}ms | sign:{}ms | send:{}ms | total:{}ms | error:{}",
-                    &pair_id[..8],
-                    yes_price_with_slippage,
-                    no_price_with_slippage,
-                    order_size,
-                    build_elapsed,
-                    sign_elapsed,
-                    send_elapsed,
-                    total_elapsed,
-                    e
+                    "❌ Illiquid FOK order failed | {} | pair:{} | price:{} | size:{} | {}ms | error:{}",
+                    illiquid_label, &pair_id[..8], illiquid_price, order_size, elapsed, e
                 );
-                return Err(anyhow::anyhow!("batch order API call failed: {}", e));
+                return Err(anyhow::anyhow!("illiquid FOK order API call failed: {}", e));
             }
         };
-        
-        // Verify result count
-        if results.len() != 2 {
-            error!(
-                "❌ Batch order returned incorrect result count | pair ID:{} | expected:2 | actual:{}",
-                &pair_id[..8],
-                results.len()
-            );
-            return Err(anyhow::anyhow!(
-                "batch order returned incorrect result count | expected:2 | actual:{}",
-                results.len()
-            ));
+
+        if illiquid_results.is_empty() {
+            return Err(anyhow::anyhow!("illiquid FOK order returned empty result"));
         }
-        
-        // Extract YES and NO order results (higher unit price submitted first, map using yes_first)
-        let (yes_result, no_result) = if yes_first {
-            (&results[0], &results[1])
-        } else {
-            (&results[1], &results[0])
+
+        let illiquid_result = &illiquid_results[0];
+        let illiquid_filled = illiquid_result.taking_amount;
+        let step1_elapsed = step1_start.elapsed().as_millis();
+
+        // If FOK didn't fill → skip trade entirely (loss $0)
+        if illiquid_filled == dec!(0) {
+            let error_msg = illiquid_result.error_msg.as_deref().unwrap_or("no fill");
+            info!(
+                "⏭️ Illiquid side not filled, skipping trade | {} FOK | pair:{} | reason:{} | {}ms",
+                illiquid_label, &pair_id[..8], error_msg, step1_elapsed
+            );
+            return Ok(OrderPairResult {
+                pair_id,
+                yes_order_id: String::new(),
+                no_order_id: String::new(),
+                yes_filled: dec!(0),
+                no_filled: dec!(0),
+                yes_size: order_size,
+                no_size: order_size,
+                success: false,
+            });
+        }
+
+        info!(
+            "✅ Illiquid side filled | {} FOK | pair:{} | filled:{} shares | {}ms",
+            illiquid_label, &pair_id[..8], illiquid_filled, step1_elapsed
+        );
+
+        // ── Step 2: Build, sign, and send liquid side with GTD ──
+        let step2_start = Instant::now();
+        let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
+
+        let liquid_order = client
+            .limit_order()
+            .token_id(liquid_token)
+            .side(Side::Buy)
+            .price(liquid_price)
+            .size(order_size)
+            .order_type(OrderType::GTD)
+            .expiration(expiration)
+            .build()
+            .await?;
+
+        let signed_liquid = client.sign(&signer, liquid_order).await?;
+
+        let liquid_results = match client.post_orders(vec![signed_liquid]).await {
+            Ok(results) => results,
+            Err(e) => {
+                let step2_elapsed = step2_start.elapsed().as_millis();
+                let total_elapsed = total_start.elapsed().as_millis();
+                error!(
+                    "❌ Liquid GTD order failed | {} | pair:{} | price:{} | size:{} | step2:{}ms | total:{}ms | error:{}",
+                    liquid_label, &pair_id[..8], liquid_price, order_size, step2_elapsed, total_elapsed, e
+                );
+                // Illiquid side already filled — this is a one-sided fill, return it so risk manager can handle
+                let (yes_filled, no_filled) = if yes_is_illiquid {
+                    (illiquid_filled, dec!(0))
+                } else {
+                    (dec!(0), illiquid_filled)
+                };
+                warn!(
+                    "⚠️ One-sided fill | {} | {} filled {} shares, {} order failed (forwarded to risk management)",
+                    &pair_id[..8], illiquid_label, illiquid_filled, liquid_label
+                );
+                return Ok(OrderPairResult {
+                    pair_id,
+                    yes_order_id: if yes_is_illiquid { illiquid_result.order_id.clone() } else { String::new() },
+                    no_order_id: if yes_is_illiquid { String::new() } else { illiquid_result.order_id.clone() },
+                    yes_filled,
+                    no_filled,
+                    yes_size: order_size,
+                    no_size: order_size,
+                    success: true,
+                });
+            }
         };
 
-        // Order result details removed, only key info kept in subsequent logs
-
-        // Check fill amounts (key metric for GTD orders)
-        let yes_filled = yes_result.taking_amount;
-        let no_filled = no_result.taking_amount;
-
-        // For GTD orders, if not fully filled within 90s, orders cancel on expiry
-        // Check actual fill amounts instead of success field
-        // Only return error when both orders have zero fills
-        if yes_filled == dec!(0) && no_filled == dec!(0) {
-            // Extract simplified error messages
-            let yes_error_msg = yes_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
-            let no_error_msg = no_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
-            
-            // Simplify error messages, remove technical details
-            let yes_error_simple = if yes_error_msg.contains("no orders found to match") {
-                "no matching orders in orderbook"
-            } else if yes_error_msg.contains("GTD") || yes_error_msg.contains("FOK") || yes_error_msg.contains("FAK") || yes_error_msg.contains("GTC") {
-                "order could not be filled"
+        if liquid_results.is_empty() {
+            let (yes_filled, no_filled) = if yes_is_illiquid {
+                (illiquid_filled, dec!(0))
             } else {
-                yes_error_msg
+                (dec!(0), illiquid_filled)
             };
-            
-            let no_error_simple = if no_error_msg.contains("no orders found to match") {
-                "no matching orders in orderbook"
-            } else if no_error_msg.contains("GTD") || no_error_msg.contains("FOK") || no_error_msg.contains("FAK") || no_error_msg.contains("GTC") {
-                "order could not be filled"
-            } else {
-                no_error_msg
-            };
-
-            error!(
-                "❌ Arbitrage trade failed | pair ID:{} | YES order:{} | NO order:{}",
-                &pair_id[..8], // Show first 8 chars only
-                yes_error_simple,
-                no_error_simple
-            );
-
-            // Detailed error info logged at debug level
-            debug!(
-                pair_id = %pair_id,
-                yes_order_id = ?yes_result.order_id,
-                no_order_id = ?no_result.order_id,
-                yes_success = yes_result.success,
-                no_success = no_result.success,
-                yes_error = %yes_error_msg,
-                no_error = %no_error_msg,
-                "both orders unfilled (details)"
-            );
-
-            return Err(anyhow::anyhow!(
-                "arbitrage failed: both YES and NO orders unfilled | YES: {}, NO: {}",
-                yes_error_simple,
-                no_error_simple
-            ));
-        }
-
-        // If at least one order filled, log warning but don't return error
-        // Let subsequent risk manager handle one-sided fill
-        if !yes_result.success || !no_result.success {
-            let yes_error_msg = yes_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
-            let no_error_msg = no_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
-
-            // Simplify error messages
-            let yes_error_simple = if yes_error_msg.contains("no orders found to match") {
-                "partially unfilled (pending)"
-            } else if yes_error_msg.contains("GTD") || yes_error_msg.contains("FOK") || yes_error_msg.contains("FAK") || yes_error_msg.contains("GTC") {
-                "partially unfilled (pending)"
-            } else {
-                "status abnormal"
-            };
-            
-            let no_error_simple = if no_error_msg.contains("no orders found to match") {
-                "partially unfilled (pending)"
-            } else if no_error_msg.contains("GTD") || no_error_msg.contains("FOK") || no_error_msg.contains("FAK") || no_error_msg.contains("GTC") {
-                "partially unfilled (pending)"
-            } else {
-                "status abnormal"
-            };
-
             warn!(
-                "⚠️ Partial order status abnormal | pair ID:{} | YES:{} (filled:{} shares) | NO:{} (filled:{} shares) | risk management activated",
-                &pair_id[..8],
-                yes_error_simple,
+                "⚠️ One-sided fill | {} | {} filled {} shares, {} returned empty (forwarded to risk management)",
+                &pair_id[..8], illiquid_label, illiquid_filled, liquid_label
+            );
+            return Ok(OrderPairResult {
+                pair_id,
+                yes_order_id: if yes_is_illiquid { illiquid_result.order_id.clone() } else { String::new() },
+                no_order_id: if yes_is_illiquid { String::new() } else { illiquid_result.order_id.clone() },
                 yes_filled,
-                no_error_simple,
-                no_filled
-            );
-
-            // Detailed error info logged at debug level
-            debug!(
-                pair_id = %pair_id,
-                yes_order_id = ?yes_result.order_id,
-                no_order_id = ?no_result.order_id,
-                yes_success = yes_result.success,
-                no_success = no_result.success,
-                yes_error = %yes_error_msg,
-                no_error = %no_error_msg,
-                "order submission status abnormal details"
-            );
+                no_filled,
+                yes_size: order_size,
+                no_size: order_size,
+                success: true,
+            });
         }
 
-        // Print different logs based on fill status
+        let liquid_result = &liquid_results[0];
+        let liquid_filled = liquid_result.taking_amount;
+        let step2_elapsed = step2_start.elapsed().as_millis();
+        let total_elapsed = total_start.elapsed().as_millis();
+
+        info!(
+            "⏱️ Timing | {} | step1(FOK) {}ms step2(GTD) {}ms total {}ms",
+            &pair_id[..8], step1_elapsed, step2_elapsed, total_elapsed
+        );
+
+        // Map back to YES/NO
+        let (yes_filled, no_filled) = if yes_is_illiquid {
+            (illiquid_filled, liquid_filled)
+        } else {
+            (liquid_filled, illiquid_filled)
+        };
+        let (yes_order_id, no_order_id) = if yes_is_illiquid {
+            (illiquid_result.order_id.clone(), liquid_result.order_id.clone())
+        } else {
+            (liquid_result.order_id.clone(), illiquid_result.order_id.clone())
+        };
+
+        // Print fill status
         if yes_filled > dec!(0) && no_filled > dec!(0) {
             info!(
                 "✅ Arbitrage trade succeeded | pair ID:{} | YES filled:{} shares | NO filled:{} shares | total filled:{} shares",
@@ -516,25 +441,19 @@ impl TradingExecutor {
                 no_filled,
                 yes_filled.min(no_filled)
             );
-        } else if yes_filled > dec!(0) || no_filled > dec!(0) {
-            let side = if yes_filled > dec!(0) { "YES" } else { "NO" };
-            let filled = if yes_filled > dec!(0) { yes_filled } else { no_filled };
-            let other_side = if yes_filled > dec!(0) { "NO" } else { "YES" };
-            warn!(
-                "⚠️ One-sided fill | {} | {} filled {} shares, {} unfilled (forwarded to risk management)",
-                &pair_id[..8], side, filled, other_side
-            );
         } else {
+            // Illiquid filled but liquid didn't — one-sided fill (rare with GTD, handled by risk manager)
+            let unfilled_side = if yes_filled == dec!(0) { "YES" } else { "NO" };
             warn!(
-                "❌ Arbitrage failed | pair ID:{} | both YES and NO unfilled",
-                &pair_id[..8]
+                "⚠️ One-sided fill | {} | {} unfilled (GTD pending, forwarded to risk management)",
+                &pair_id[..8], unfilled_side
             );
         }
 
         Ok(OrderPairResult {
             pair_id,
-            yes_order_id: yes_result.order_id.clone(),
-            no_order_id: no_result.order_id.clone(),
+            yes_order_id,
+            no_order_id,
             yes_filled,
             no_filled,
             yes_size: order_size,
