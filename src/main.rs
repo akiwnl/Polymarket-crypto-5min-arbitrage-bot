@@ -181,6 +181,11 @@ async fn run_merge_task(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 安装 rustls CryptoProvider（必须在任何 TLS 连接之前）
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     // 初始化日志
     utils::logger::init_logger()?;
 
