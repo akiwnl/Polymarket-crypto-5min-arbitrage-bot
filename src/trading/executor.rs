@@ -29,7 +29,7 @@ pub struct TradingExecutor {
     client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
     private_key: String,
     max_order_size: Decimal,
-    slippage: [Decimal; 2], // [first, second]，仅下降侧用 second，上涨与持平用 first
+    slippage: [Decimal; 2], // [first, second], down side uses second, up/flat uses first
     gtd_expiration_secs: u64,
     arbitrage_order_type: OrderType,
     dry_run: bool,
@@ -46,7 +46,7 @@ impl TradingExecutor {
         dry_run: bool,
     ) -> Result<Self> {
         if dry_run {
-            info!("[DRY RUN] 交易执行器以模拟模式启动，不会执行真实交易");
+            info!("[DRY RUN] Trading executor started in simulation mode, no real trades will be executed");
             return Ok(Self {
                 client: None,
                 private_key,
@@ -62,17 +62,17 @@ impl TradingExecutor {
             });
         }
 
-        // 验证私钥格式
+        // Validate private key format
         let signer = LocalSigner::from_str(&private_key)
-            .map_err(|e| anyhow::anyhow!("私钥格式无效: {}. 请确保私钥是64字符的十六进制字符串（不带0x前缀）", e))?
+            .map_err(|e| anyhow::anyhow!("invalid private key format: {}. Ensure the key is a 64-char hex string (without 0x prefix)", e))?
             .with_chain_id(Some(POLYGON));
 
         let config = Config::builder().use_server_time(false).build();
         let mut auth_builder = Client::new("https://clob.polymarket.com", config)
-            .map_err(|e| anyhow::anyhow!("创建CLOB客户端失败: {}", e))?
+            .map_err(|e| anyhow::anyhow!("failed to create CLOB client: {}", e))?
             .authentication_builder(&signer);
 
-        // 如果提供了proxy_address，设置funder和signature_type（按照Python SDK模式）
+        // If proxy_address provided, set funder and signature_type (following Python SDK pattern)
         if let Some(funder) = proxy_address {
             auth_builder = auth_builder
                 .funder(funder)
@@ -84,7 +84,7 @@ impl TradingExecutor {
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "API认证失败: {}. 可能的原因：1) 私钥无效 2) 网络问题 3) Polymarket API服务不可用",
+                    "API authentication failed: {}. Possible causes: 1) invalid private key 2) network issue 3) Polymarket API unavailable",
                     e
                 )
             })?;
@@ -104,32 +104,32 @@ impl TradingExecutor {
         })
     }
 
-    /// 验证认证是否真的成功 - 按照官方示例使用 api_keys() 来验证
+    /// Verify authentication succeeded - using api_keys() per official example
     pub async fn verify_authentication(&self) -> Result<()> {
         if self.dry_run {
-            info!("[DRY RUN] 跳过认证验证");
+            info!("[DRY RUN] Skipping authentication verification");
             return Ok(());
         }
-        // 按照官方示例，使用 api_keys() 来验证认证状态
+        // Per official example, use api_keys() to verify authentication status
         self.client.as_ref().unwrap().api_keys().await
-            .map_err(|e| anyhow::anyhow!("认证验证失败: API调用返回错误: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("authentication verification failed: API call returned error: {}", e))?;
         Ok(())
     }
 
-    /// 取消该账户所有挂单（收尾时使用）
+    /// Cancel all pending orders for this account (used during wind-down)
     pub async fn cancel_all_orders(&self) -> Result<()> {
         if self.dry_run {
-            info!("[DRY RUN] 模拟取消所有挂单");
+            info!("[DRY RUN] Simulating cancel all pending orders");
             return Ok(());
         }
         self.client.as_ref().unwrap()
             .cancel_all_orders()
             .await
-            .map_err(|e| anyhow::anyhow!("取消所有挂单失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("failed to cancel all pending orders: {}", e))?;
         Ok(())
     }
 
-    /// 以指定价格下 GTC 卖单（收尾时市价意图卖出单腿持仓）
+    /// Place GTC sell order at specified price (market-intent sell for single-leg position during wind-down)
     pub async fn sell_at_price(
         &self,
         token_id: U256,
@@ -138,7 +138,7 @@ impl TradingExecutor {
     ) -> Result<()> {
         if self.dry_run {
             info!(
-                "[DRY RUN] 模拟卖出 | token_id={:#x} | 价格:{:.4} | 数量:{}",
+                "[DRY RUN] Simulated sell | token_id={:#x} | price:{:.4} | size:{}",
                 token_id, price, size
             );
             return Ok(());
@@ -159,11 +159,11 @@ impl TradingExecutor {
         client
             .post_order(signed)
             .await
-            .map_err(|e| anyhow::anyhow!("卖出订单提交失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("sell order submission failed: {}", e))?;
         Ok(())
     }
 
-    /// 按方向取滑点：仅下降(↓)用 second，上涨(↑)和持平(−/空)用 first
+    /// Get slippage by direction: down(↓) uses second, up(↑) and flat use first
     fn slippage_for_direction(&self, dir: &str) -> Decimal {
         if dir == "↓" {
             self.slippage[1]
@@ -172,53 +172,53 @@ impl TradingExecutor {
         }
     }
 
-    /// 执行套利交易（使用post_orders批量提交YES和NO订单；订单类型由 arbitrage_order_type 配置，GTD 时配合 gtd_expiration_secs）
-    /// yes_dir / no_dir：涨跌方向 "↑" "↓" "−" 或 ""，用于按方向分配滑点（仅下降=second，上涨与持平=first）
+    /// Execute arbitrage trade (batch submit YES and NO orders via post_orders; order type configured by arbitrage_order_type, GTD uses gtd_expiration_secs)
+    /// yes_dir / no_dir: price direction "↑" "↓" "−" or "", used to assign slippage by direction (down=second, up/flat=first)
     pub async fn execute_arbitrage_pair(
         &self,
         opp: &ArbitrageOpportunity,
         yes_dir: &str,
         no_dir: &str,
     ) -> Result<OrderPairResult> {
-        // 性能计时：总开始时间
+        // Performance timing: total start
         let total_start = Instant::now();
         
-        // 这个日志已经在main.rs中打印了，这里不再重复打印
+        // This log is already printed in main.rs, no need to repeat here
         let expiry_info = if matches!(self.arbitrage_order_type, OrderType::GTD) {
-            format!("过期:{}秒", self.gtd_expiration_secs)
+            format!("expiry:{}s", self.gtd_expiration_secs)
         } else {
-            "无过期".to_string()
+            "no expiry".to_string()
         };
         debug!(
             market_id = %opp.market_id,
             profit_pct = %opp.profit_percentage,
             order_type = %self.arbitrage_order_type,
-            "开始执行套利交易（批量下单，订单类型:{}，{}）",
+            "starting arbitrage trade (batch orders, type:{}, {})",
             self.arbitrage_order_type,
             expiry_info
         );
 
-        // 计算实际下单数量（考虑最大订单限制）
+        // Calculate actual order size (considering max order limit)
         let yes_token_id = U256::from_str(&opp.yes_token_id.to_string())?;
         let no_token_id = U256::from_str(&opp.no_token_id.to_string())?;
 
         let order_size = opp.yes_size.min(opp.no_size).min(self.max_order_size);
 
-        // 生成订单对ID
+        // Generate order pair ID
         let pair_id = Uuid::new_v4().to_string();
 
-        // 计算过期时间：当前时间 + 配置的过期时间
+        // Calculate expiration: current time + configured expiration
         let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
 
-        // 滑点按涨跌方向分配：上涨=first，下降/持平=second
+        // Slippage by direction: up=first, down/flat=second
         let yes_slippage_apply = self.slippage_for_direction(yes_dir);
         let no_slippage_apply = self.slippage_for_direction(no_dir);
         let yes_price_with_slippage = (opp.yes_ask_price + yes_slippage_apply).min(dec!(1.0));
         let no_price_with_slippage = (opp.no_ask_price + no_slippage_apply).min(dec!(1.0));
         
-        // 打印选档信息（加滑点后的价格）
+        // Print level selection info (price with slippage)
         info!(
-            "📋 选档 | YES {:.4}×{:.2} NO {:.4}×{:.2}",
+            "📋 Level | YES {:.4}×{:.2} NO {:.4}×{:.2}",
             yes_price_with_slippage, order_size,
             no_price_with_slippage, order_size
         );
@@ -229,30 +229,30 @@ impl TradingExecutor {
             String::new()
         };
         info!(
-            "📤 下单 | YES {:.4}→{:.4}×{} NO {:.4}→{:.4}×{} | {}{}",
+            "📤 Order | YES {:.4}→{:.4}×{} NO {:.4}→{:.4}×{} | {}{}",
             opp.yes_ask_price, yes_price_with_slippage, order_size,
             opp.no_ask_price, no_price_with_slippage, order_size,
             self.arbitrage_order_type, expiry_suffix
         );
 
-        // 下单前检查：双边金额均须 > $1（交易所最小下单金额）
+        // Pre-order check: both sides must be > $1 (exchange minimum)
         let yes_amount_usd = yes_price_with_slippage * order_size;
         let no_amount_usd = no_price_with_slippage * order_size;
         if yes_amount_usd <= dec!(1) || no_amount_usd <= dec!(1) {
             warn!(
-                "⏭️ 跳过下单 | YES金额:{:.2} USD NO金额:{:.2} USD | 双边均须 > $1",
+                "⏭️ Skipping order | YES amount:{:.2} USD NO amount:{:.2} USD | both sides must be > $1",
                 yes_amount_usd, no_amount_usd
             );
             return Err(anyhow::anyhow!(
-                "下单金额不满足交易所最小要求: YES {:.2} USD, NO {:.2} USD，双边均须 > $1",
+                "order amount below exchange minimum: YES {:.2} USD, NO {:.2} USD, both sides must be > $1",
                 yes_amount_usd, no_amount_usd
             ));
         }
 
-        // Dry run: 模拟完整成交，不实际下单
+        // Dry run: simulate full fill, no actual orders
         if self.dry_run {
             info!(
-                "[DRY RUN] 模拟套利交易 | 市场:{} | YES价格:{:.4} (含滑点:{:.4}) | NO价格:{:.4} (含滑点:{:.4}) | 数量:{} | 订单类型:{}",
+                "[DRY RUN] Simulated arbitrage | market:{} | YES price:{:.4} (with slippage:{:.4}) | NO price:{:.4} (with slippage:{:.4}) | size:{} | order type:{}",
                 opp.market_id,
                 opp.yes_ask_price, yes_price_with_slippage,
                 opp.no_ask_price, no_price_with_slippage,
@@ -275,10 +275,10 @@ impl TradingExecutor {
 
         let client = self.client.as_ref().unwrap();
 
-        // 性能计时：并行构建YES和NO订单开始
+        // Performance timing: parallel YES/NO order building start
         let build_start = Instant::now();
 
-        // 并行构建YES和NO订单；仅 GTD 时设置 expiration（SDK 规定非 GTD 不可设过期）
+        // Build YES and NO orders in parallel; only set expiration for GTD (SDK requires no expiry for non-GTD)
         let (yes_order, no_order) = tokio::join!(
             async {
                 let b = client
@@ -314,14 +314,14 @@ impl TradingExecutor {
         let no_order = no_order?;
         let build_elapsed = build_start.elapsed().as_millis();
 
-        // 性能计时：并行签名开始
+        // Performance timing: parallel signing start
         let sign_start = Instant::now();
         
-        // 创建signer
+        // Create signer
         let signer = LocalSigner::from_str(&self.private_key)?
             .with_chain_id(Some(POLYGON));
         
-        // 并行签名YES和NO订单
+        // Sign YES and NO orders in parallel
         let (signed_yes_result, signed_no_result) = tokio::join!(
             client.sign(&signer, yes_order),
             client.sign(&signer, no_order)
@@ -331,10 +331,10 @@ impl TradingExecutor {
         let signed_no = signed_no_result?;
         let sign_elapsed = sign_start.elapsed().as_millis();
 
-        // 性能计时：发送订单开始
+        // Performance timing: order send start
         let send_start = Instant::now();
         
-        // 单价高的排前面发送；提交后需按相同顺序从 results 中解析 yes_result / no_result
+        // Higher unit price first; parse yes_result/no_result from results in same order after submission
         let yes_first = yes_price_with_slippage >= no_price_with_slippage;
         let orders_to_send: Vec<_> = if yes_first {
             vec![signed_yes, signed_no]
@@ -347,7 +347,7 @@ impl TradingExecutor {
                 let total_elapsed = total_start.elapsed().as_millis();
                 
                 info!(
-                    "⏱️ 耗时 | {} | 构建{}ms 签名{}ms 发送{}ms 总{}ms",
+                    "⏱️ Timing | {} | build {}ms sign {}ms send {}ms total {}ms",
                     &pair_id[..8], build_elapsed, sign_elapsed, send_elapsed, total_elapsed
                 );
                 
@@ -358,7 +358,7 @@ impl TradingExecutor {
                 let total_elapsed = total_start.elapsed().as_millis();
                 
                 error!(
-                    "❌ 批量下单API调用失败 | 订单对ID:{} | YES价格:{} (含滑点) | NO价格:{} (含滑点) | 数量:{} | 构建耗时:{}ms | 签名耗时:{}ms | 发送耗时:{}ms | 总耗时:{}ms | 错误:{}",
+                    "❌ Batch order API call failed | pair ID:{} | YES price:{} (with slippage) | NO price:{} (with slippage) | size:{} | build:{}ms | sign:{}ms | send:{}ms | total:{}ms | error:{}",
                     &pair_id[..8],
                     yes_price_with_slippage,
                     no_price_with_slippage,
@@ -369,75 +369,75 @@ impl TradingExecutor {
                     total_elapsed,
                     e
                 );
-                return Err(anyhow::anyhow!("批量下单API调用失败: {}", e));
+                return Err(anyhow::anyhow!("batch order API call failed: {}", e));
             }
         };
         
-        // 验证返回结果数量
+        // Verify result count
         if results.len() != 2 {
             error!(
-                "❌ 批量下单返回结果数量不正确 | 订单对ID:{} | 期望:2 | 实际:{}",
+                "❌ Batch order returned incorrect result count | pair ID:{} | expected:2 | actual:{}",
                 &pair_id[..8],
                 results.len()
             );
             return Err(anyhow::anyhow!(
-                "批量下单返回结果数量不正确 | 期望:2 | 实际:{}",
+                "batch order returned incorrect result count | expected:2 | actual:{}",
                 results.len()
             ));
         }
         
-        // 提取YES和NO订单的结果（提交顺序为单价高者在前，需按 yes_first 映射）
+        // Extract YES and NO order results (higher unit price submitted first, map using yes_first)
         let (yes_result, no_result) = if yes_first {
             (&results[0], &results[1])
         } else {
             (&results[1], &results[0])
         };
 
-        // 订单返回结果详情已移除，只保留关键信息在后续日志中
+        // Order result details removed, only key info kept in subsequent logs
 
-        // 检查成交数量（GTD订单的关键指标）
+        // Check fill amounts (key metric for GTD orders)
         let yes_filled = yes_result.taking_amount;
         let no_filled = no_result.taking_amount;
 
-        // 对于GTD订单，如果无法在90秒内全部成交，订单会在过期后取消
-        // 我们应该检查实际的成交数量，而不是 success 字段
-        // 只有在两个订单都完全没有成交时，才返回错误
+        // For GTD orders, if not fully filled within 90s, orders cancel on expiry
+        // Check actual fill amounts instead of success field
+        // Only return error when both orders have zero fills
         if yes_filled == dec!(0) && no_filled == dec!(0) {
-            // 提取简化的错误信息
+            // Extract simplified error messages
             let yes_error_msg = yes_result
                 .error_msg
                 .as_deref()
-                .unwrap_or("未知错误");
+                .unwrap_or("unknown error");
             let no_error_msg = no_result
                 .error_msg
                 .as_deref()
-                .unwrap_or("未知错误");
+                .unwrap_or("unknown error");
             
-            // 简化错误消息，去掉技术细节
+            // Simplify error messages, remove technical details
             let yes_error_simple = if yes_error_msg.contains("no orders found to match") {
-                "订单簿中无匹配订单"
+                "no matching orders in orderbook"
             } else if yes_error_msg.contains("GTD") || yes_error_msg.contains("FOK") || yes_error_msg.contains("FAK") || yes_error_msg.contains("GTC") {
-                "订单无法成交"
+                "order could not be filled"
             } else {
                 yes_error_msg
             };
             
             let no_error_simple = if no_error_msg.contains("no orders found to match") {
-                "订单簿中无匹配订单"
+                "no matching orders in orderbook"
             } else if no_error_msg.contains("GTD") || no_error_msg.contains("FOK") || no_error_msg.contains("FAK") || no_error_msg.contains("GTC") {
-                "订单无法成交"
+                "order could not be filled"
             } else {
                 no_error_msg
             };
 
             error!(
-                "❌ 套利交易失败 | 订单对ID:{} | YES订单:{} | NO订单:{}",
-                &pair_id[..8], // 只显示前8个字符
+                "❌ Arbitrage trade failed | pair ID:{} | YES order:{} | NO order:{}",
+                &pair_id[..8], // Show first 8 chars only
                 yes_error_simple,
                 no_error_simple
             );
 
-            // 详细错误信息记录在debug级别
+            // Detailed error info logged at debug level
             debug!(
                 pair_id = %pair_id,
                 yes_order_id = ?yes_result.order_id,
@@ -446,47 +446,47 @@ impl TradingExecutor {
                 no_success = no_result.success,
                 yes_error = %yes_error_msg,
                 no_error = %no_error_msg,
-                "两个订单都未成交（详细信息）"
+                "both orders unfilled (details)"
             );
 
             return Err(anyhow::anyhow!(
-                "套利失败: YES和NO订单都未成交 | YES: {}, NO: {}",
+                "arbitrage failed: both YES and NO orders unfilled | YES: {}, NO: {}",
                 yes_error_simple,
                 no_error_simple
             ));
         }
 
-        // 如果至少有一个订单成交了，记录警告但不返回错误
-        // 让后续的风险管理器来处理单边成交的情况
+        // If at least one order filled, log warning but don't return error
+        // Let subsequent risk manager handle one-sided fill
         if !yes_result.success || !no_result.success {
             let yes_error_msg = yes_result
                 .error_msg
                 .as_deref()
-                .unwrap_or("未知错误");
+                .unwrap_or("unknown error");
             let no_error_msg = no_result
                 .error_msg
                 .as_deref()
-                .unwrap_or("未知错误");
+                .unwrap_or("unknown error");
 
-            // 简化错误消息
+            // Simplify error messages
             let yes_error_simple = if yes_error_msg.contains("no orders found to match") {
-                "部分未成交（已挂单）"
+                "partially unfilled (pending)"
             } else if yes_error_msg.contains("GTD") || yes_error_msg.contains("FOK") || yes_error_msg.contains("FAK") || yes_error_msg.contains("GTC") {
-                "部分未成交（已挂单）"
+                "partially unfilled (pending)"
             } else {
-                "状态异常"
+                "status abnormal"
             };
             
             let no_error_simple = if no_error_msg.contains("no orders found to match") {
-                "部分未成交（已挂单）"
+                "partially unfilled (pending)"
             } else if no_error_msg.contains("GTD") || no_error_msg.contains("FOK") || no_error_msg.contains("FAK") || no_error_msg.contains("GTC") {
-                "部分未成交（已挂单）"
+                "partially unfilled (pending)"
             } else {
-                "状态异常"
+                "status abnormal"
             };
 
             warn!(
-                "⚠️ 部分订单状态异常 | 订单对ID:{} | YES:{} (成交:{}份) | NO:{} (成交:{}份) | 已启动风险管理",
+                "⚠️ Partial order status abnormal | pair ID:{} | YES:{} (filled:{} shares) | NO:{} (filled:{} shares) | risk management activated",
                 &pair_id[..8],
                 yes_error_simple,
                 yes_filled,
@@ -494,7 +494,7 @@ impl TradingExecutor {
                 no_filled
             );
 
-            // 详细错误信息记录在debug级别
+            // Detailed error info logged at debug level
             debug!(
                 pair_id = %pair_id,
                 yes_order_id = ?yes_result.order_id,
@@ -503,14 +503,14 @@ impl TradingExecutor {
                 no_success = no_result.success,
                 yes_error = %yes_error_msg,
                 no_error = %no_error_msg,
-                "订单提交状态异常详情"
+                "order submission status abnormal details"
             );
         }
 
-        // 根据成交情况打印不同的日志
+        // Print different logs based on fill status
         if yes_filled > dec!(0) && no_filled > dec!(0) {
             info!(
-                "✅ 套利交易成功 | 订单对ID:{} | YES成交:{}份 | NO成交:{}份 | 总成交:{}份",
+                "✅ Arbitrage trade succeeded | pair ID:{} | YES filled:{} shares | NO filled:{} shares | total filled:{} shares",
                 &pair_id[..8],
                 yes_filled,
                 no_filled,
@@ -521,12 +521,12 @@ impl TradingExecutor {
             let filled = if yes_filled > dec!(0) { yes_filled } else { no_filled };
             let other_side = if yes_filled > dec!(0) { "NO" } else { "YES" };
             warn!(
-                "⚠️ 单边成交 | {} | {} 成交 {} 份，{} 未成交（已交风控）",
+                "⚠️ One-sided fill | {} | {} filled {} shares, {} unfilled (forwarded to risk management)",
                 &pair_id[..8], side, filled, other_side
             );
         } else {
             warn!(
-                "❌ 套利失败 | 订单对ID:{} | YES和NO都未成交",
+                "❌ Arbitrage failed | pair ID:{} | both YES and NO unfilled",
                 &pair_id[..8]
             );
         }

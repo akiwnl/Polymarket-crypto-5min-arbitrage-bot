@@ -7,8 +7,8 @@ use tracing::{debug, info, trace};
 use poly_5min_bot::positions::{get_positions, Position};
 
 pub struct PositionTracker {
-    positions: DashMap<U256, Decimal>, // token_id -> 数量（正数=持有多头，负数=持有空头）
-    exposure_costs: DashMap<U256, Decimal>, // token_id -> 成本（USD），用于跟踪风险敞口
+    positions: DashMap<U256, Decimal>, // token_id -> quantity (positive=long, negative=short)
+    exposure_costs: DashMap<U256, Decimal>, // token_id -> cost (USD), used for tracking risk exposure
     max_exposure: Decimal,
 }
 
@@ -22,119 +22,119 @@ impl PositionTracker {
     }
 
     pub fn update_position(&self, token_id: U256, delta: Decimal) {
-        trace!("update_position: 开始 | token_id:{} | delta:{}", token_id, delta);
+        trace!("update_position: start | token_id:{} | delta:{}", token_id, delta);
         
-        trace!("update_position: 准备获取positions写锁");
+        trace!("update_position: acquiring positions write lock");
         let mut entry = self.positions.entry(token_id).or_insert(dec!(0));
-        trace!("update_position: positions写锁已获取");
+        trace!("update_position: positions write lock acquired");
         *entry += delta;
-        trace!("update_position: 持仓已更新，新值:{}", *entry);
+        trace!("update_position: position updated, new value:{}", *entry);
 
-        // 如果持仓变为0或接近0，可以清理
-        // 关键修复：先释放 positions 的写锁，再访问 exposure_costs
-        // 这样可以避免与 update_exposure_cost 的死锁
+        // If position becomes 0 or near 0, clean up
+        // Key fix: release positions write lock before accessing exposure_costs
+        // This avoids deadlock with update_exposure_cost
         let should_remove = entry.abs() < dec!(0.0001);
         trace!("update_position: should_remove:{}", should_remove);
         if should_remove {
             *entry = dec!(0);
-            trace!("update_position: 持仓已清零");
+            trace!("update_position: position cleared to zero");
         }
-        // 释放 positions 的锁
+        // Release positions lock
         drop(entry);
-        trace!("update_position: positions写锁已释放");
+        trace!("update_position: positions write lock released");
         
-        // 现在可以安全地访问 exposure_costs
+        // Now safe to access exposure_costs
         if should_remove {
-            trace!("update_position: 准备remove exposure_costs");
+            trace!("update_position: removing exposure_costs");
             self.exposure_costs.remove(&token_id);
-            trace!("update_position: exposure_costs已remove");
+            trace!("update_position: exposure_costs removed");
         }
         
-        trace!("update_position: 完成");
+        trace!("update_position: done");
     }
 
-    /// 更新风险敞口成本（USD）
-    /// price: 买入价格
-    /// delta: 持仓变化量（正数=买入，负数=卖出）
+    /// Update risk exposure cost (USD)
+    /// price: buy price
+    /// delta: position change (positive=buy, negative=sell)
     pub fn update_exposure_cost(&self, token_id: U256, price: Decimal, delta: Decimal) {
-        trace!("update_exposure_cost: 开始 | token_id:{} | price:{} | delta:{}", token_id, price, delta);
+        trace!("update_exposure_cost: start | token_id:{} | price:{} | delta:{}", token_id, price, delta);
         
         if delta == dec!(0) {
-            trace!("update_exposure_cost: delta为0，直接返回");
-            return; // 没有变化，不需要更新
+            trace!("update_exposure_cost: delta is 0, returning");
+            return; // No change, no update needed
         }
         
-        trace!("update_exposure_cost: 准备获取positions读锁");
-        // 关键修复：先获取 positions 的读锁，释放后再获取 exposure_costs 的写锁
-        // 这样可以避免与 update_position 的死锁（update_position 先获取 positions 写锁，再访问 exposure_costs）
+        trace!("update_exposure_cost: acquiring positions read lock");
+        // Key fix: acquire positions read lock first, release it, then acquire exposure_costs write lock
+        // This avoids deadlock with update_position (which acquires positions write lock first, then accesses exposure_costs)
         let current_pos = if delta < dec!(0) {
-            trace!("update_exposure_cost: 卖出操作，开始获取positions读锁");
-            // 卖出时，需要先获取当前持仓来计算比例
+            trace!("update_exposure_cost: sell operation, acquiring positions read lock");
+            // On sell, need current position to calculate ratio
             let pos = self.positions.get(&token_id);
-            trace!("update_exposure_cost: positions读锁已获取");
+            trace!("update_exposure_cost: positions read lock acquired");
             let result = pos.map(|v| *v.value()).unwrap_or(dec!(0));
-            trace!("update_exposure_cost: positions读锁已释放，current_pos:{}", result);
+            trace!("update_exposure_cost: positions read lock released, current_pos:{}", result);
             result
         } else {
-            trace!("update_exposure_cost: 买入操作，不需要获取positions");
-            dec!(0) // 买入时不需要
+            trace!("update_exposure_cost: buy operation, no positions lock needed");
+            dec!(0) // Not needed for buy
         };
         
-        trace!("update_exposure_cost: 准备获取exposure_costs写锁");
-        // 现在 positions 的锁已经释放，可以安全地获取 exposure_costs 的写锁
+        trace!("update_exposure_cost: acquiring exposure_costs write lock");
+        // positions lock released, safe to acquire exposure_costs write lock
         let mut entry = self.exposure_costs.entry(token_id).or_insert(dec!(0));
-        trace!("update_exposure_cost: exposure_costs写锁已获取");
+        trace!("update_exposure_cost: exposure_costs write lock acquired");
         
         if delta > dec!(0) {
-            trace!("update_exposure_cost: 买入分支，计算cost_delta");
-            // 买入，增加风险敞口（成本 = 价格 * 数量）
+            trace!("update_exposure_cost: buy branch, calculating cost_delta");
+            // Buy: increase risk exposure (cost = price * quantity)
             let cost_delta = price * delta;
             *entry += cost_delta;
-            trace!("update_exposure_cost: 买入完成，新成本:{}", *entry);
+            trace!("update_exposure_cost: buy done, new cost:{}", *entry);
         } else {
-            trace!("update_exposure_cost: 卖出分支，current_pos:{}", current_pos);
-            // 卖出，减少风险敞口（按比例减少）
+            trace!("update_exposure_cost: sell branch, current_pos:{}", current_pos);
+            // Sell: reduce risk exposure (proportional reduction)
             if current_pos > dec!(0) {
-                trace!("update_exposure_cost: 计算卖出比例");
-                // 计算卖出的比例
+                trace!("update_exposure_cost: calculating sell ratio");
+                // Calculate sell ratio
                 let sell_amount = (-delta).min(current_pos);
                 let reduction_ratio = sell_amount / current_pos;
-                trace!("update_exposure_cost: sell_amount:{} | reduction_ratio:{} | 当前成本:{}", sell_amount, reduction_ratio, *entry);
-                // 按比例减少成本
+                trace!("update_exposure_cost: sell_amount:{} | reduction_ratio:{} | current cost:{}", sell_amount, reduction_ratio, *entry);
+                // Reduce cost proportionally
                 *entry = (*entry * (dec!(1) - reduction_ratio)).max(dec!(0));
-                trace!("update_exposure_cost: 卖出完成，新成本:{}", *entry);
+                trace!("update_exposure_cost: sell done, new cost:{}", *entry);
             } else {
-                trace!("update_exposure_cost: current_pos为0，直接清零");
+                trace!("update_exposure_cost: current_pos is 0, clearing to zero");
                 *entry = dec!(0);
             }
         }
         
-        trace!("update_exposure_cost: 检查是否需要清理，当前成本:{}", *entry);
-        // 如果成本接近0，清理
+        trace!("update_exposure_cost: checking if cleanup needed, current cost:{}", *entry);
+        // If cost near 0, clean up
         if *entry < dec!(0.01) {
-            trace!("update_exposure_cost: 成本接近0，准备清理");
+            trace!("update_exposure_cost: cost near 0, cleaning up");
             *entry = dec!(0);
-            drop(entry); // 显式释放写锁
-            trace!("update_exposure_cost: 写锁已释放，准备remove");
+            drop(entry); // Explicitly release write lock
+            trace!("update_exposure_cost: write lock released, removing");
             self.exposure_costs.remove(&token_id);
-            trace!("update_exposure_cost: remove完成");
+            trace!("update_exposure_cost: remove done");
         } else {
-            trace!("update_exposure_cost: 成本不为0，保持entry");
-            drop(entry); // 显式释放写锁
+            trace!("update_exposure_cost: cost non-zero, keeping entry");
+            drop(entry); // Explicitly release write lock
         }
         
-        trace!("update_exposure_cost: 完成");
+        trace!("update_exposure_cost: done");
     }
 
-    /// 获取最大风险敞口限制
+    /// Get max risk exposure limit
     pub fn max_exposure(&self) -> Decimal {
         self.max_exposure
     }
 
-    /// 重置风险敞口（新一轮开始时调用，清空成本缓存，使本轮从 0 敞口重新累计）
+    /// Reset risk exposure (called at start of new round, clears cost cache for re-accumulation from 0)
     pub fn reset_exposure(&self) {
         self.exposure_costs.clear();
-        info!("🔄 风险敞口已重置（新一轮）");
+        info!("🔄 Risk exposure reset (new round)");
     }
 
     pub fn get_position(&self, token_id: U256) -> Decimal {
@@ -144,26 +144,26 @@ impl PositionTracker {
             .unwrap_or(dec!(0))
     }
 
-    /// 计算持仓不平衡度（0.0 = 完全平衡，1.0 = 完全不平衡）
+    /// Calculate position imbalance (0.0 = fully balanced, 1.0 = fully imbalanced)
     pub fn calculate_imbalance(&self, yes_token: U256, no_token: U256) -> Decimal {
         let yes_pos = self.get_position(yes_token);
         let no_pos = self.get_position(no_token);
 
         let total = yes_pos + no_pos;
         if total == dec!(0) {
-            return dec!(0); // 完全平衡
+            return dec!(0); // Fully balanced
         }
 
-        // 不平衡度 = abs(yes - no) / (yes + no)
+        // Imbalance = abs(yes - no) / (yes + no)
         let imbalance = (yes_pos - no_pos).abs() / total;
         imbalance
     }
 
-    /// 计算当前总风险敞口（USD）
-    /// 基于所有持仓的成本总和
+    /// Calculate current total risk exposure (USD)
+    /// Based on total cost of all positions
     pub fn calculate_exposure(&self) -> Decimal {
-        // 计算总风险敞口（所有持仓的成本总和）
-        // 使用 collect 先收集到 Vec，避免长时间持有锁
+        // Calculate total risk exposure (sum of all position costs)
+        // Collect to Vec first to avoid holding the lock for too long
         let costs: Vec<Decimal> = self.exposure_costs
             .iter()
             .map(|entry| *entry.value())
@@ -175,16 +175,16 @@ impl PositionTracker {
         self.calculate_exposure() <= self.max_exposure
     }
 
-    /// 检查如果执行新订单，是否会超过风险敞口限制
-    /// yes_cost: YES订单的成本（价格 * 数量）
-    /// no_cost: NO订单的成本（价格 * 数量）
+    /// Check if executing a new order would exceed risk exposure limit
+    /// yes_cost: YES order cost (price * quantity)
+    /// no_cost: NO order cost (price * quantity)
     pub fn would_exceed_limit(&self, yes_cost: Decimal, no_cost: Decimal) -> bool {
         let current_exposure = self.calculate_exposure();
         let new_order_cost = yes_cost + no_cost;
         (current_exposure + new_order_cost) > self.max_exposure
     }
 
-    /// 获取所有持仓（token_id -> 数量）
+    /// Get all positions (token_id -> quantity)
     pub fn get_all_positions(&self) -> Vec<(U256, Decimal)> {
         self.positions
             .iter()
@@ -193,46 +193,46 @@ impl PositionTracker {
             .collect()
     }
 
-    /// 获取YES和NO的持仓
+    /// Get YES and NO positions
     pub fn get_pair_positions(&self, yes_token: U256, no_token: U256) -> (Decimal, Decimal) {
         (self.get_position(yes_token), self.get_position(no_token))
     }
 
-    /// 从 Data API 同步持仓，完全覆盖本地缓存
-    /// 这个方法会从API获取最新持仓，清空并重建本地positions map
-    /// 用于定时同步任务，确保本地缓存与链上实际持仓一致
+    /// Sync positions from Data API, fully overwriting local cache
+    /// This method fetches latest positions from API, clears and rebuilds local positions map
+    /// Used for scheduled sync to ensure local cache matches on-chain positions
     pub async fn sync_from_api(&self) -> Result<Vec<Position>> {
         use std::collections::HashMap;
         use polymarket_client_sdk::types::B256;
         
         let positions = get_positions().await?;
         
-        // 清空现有持仓（敞口仅由「执行套利」时增加、Merge 时扣减，不从 API 回填）
+        // Clear existing positions (exposure only increases during arbitrage execution, decreases during merge, not backfilled from API)
         self.positions.clear();
         
-        // 从API获取的持仓更新到本地缓存
+        // Update local cache with positions from API
         let mut updated_count = 0;
         let mut valid_positions = Vec::new();
         
         for pos in positions {
             if pos.size > dec!(0) {
-                // Position.asset 就是 token_id
+                // Position.asset is the token_id
                 self.positions.insert(pos.asset, pos.size);
                 valid_positions.push(pos);
                 updated_count += 1;
             }
         }
         
-        // 按市场分组打印持仓
+        // Print positions grouped by market
         if !valid_positions.is_empty() {
             let mut by_market: HashMap<B256, Vec<&Position>> = HashMap::new();
             for pos in &valid_positions {
                 by_market.entry(pos.condition_id).or_default().push(pos);
             }
             
-            info!("📊 持仓同步完成 | 共 {} 个持仓，{} 个市场", updated_count, by_market.len());
+            info!("📊 Position sync complete | {} positions, {} markets", updated_count, by_market.len());
             
-            // 按市场分组打印，每个市场一行
+            // Print by market, one line per market
             for (_condition_id, market_positions) in by_market.iter() {
                 let mut yes_pos = dec!(0);
                 let mut no_pos = dec!(0);
@@ -249,7 +249,7 @@ impl PositionTracker {
                     }
                 }
                 
-                // 截断过长的标题
+                // Truncate long titles
                 let title_display = if market_title.len() > 40 {
                     format!("{}...", &market_title[..37])
                 } else {
@@ -264,7 +264,7 @@ impl PositionTracker {
                 );
             }
         } else {
-            info!("📊 持仓同步完成 | 当前无持仓");
+            info!("📊 Position sync complete | no current positions");
         }
         
         Ok(valid_positions)

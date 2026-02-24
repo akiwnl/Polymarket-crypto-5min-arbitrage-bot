@@ -28,8 +28,8 @@ use crate::risk::positions::PositionTracker;
 use crate::risk::{HedgeMonitor, PositionBalancer, RiskManager};
 use crate::trading::TradingExecutor;
 
-/// 从持仓中筛出 **YES 和 NO 都持仓** 的 condition_id，仅这些市场才能 merge；单边持仓直接跳过。
-/// Data API 可能返回 outcome_index 0/1（0=Yes, 1=No）或 1/2（与 CTF index_set 一致），两种都支持。
+/// Filter condition_ids where **both YES and NO** are held; only these markets can merge; single-side positions are skipped.
+/// Data API may return outcome_index 0/1 (0=Yes, 1=No) or 1/2 (matching CTF index_set); both are supported.
 fn condition_ids_with_both_sides(positions: &[Position]) -> Vec<B256> {
     let mut by_condition: HashMap<B256, HashSet<i32>> = HashMap::new();
     for p in positions {
@@ -50,10 +50,10 @@ fn condition_ids_with_both_sides(positions: &[Position]) -> Vec<B256> {
         .collect()
 }
 
-/// 从持仓中构建 condition_id -> (yes_token_id, no_token_id, merge_amount)，用于 merge 成功后扣减敞口。
-/// 支持 outcome_index 0/1（0=Yes, 1=No）与 1/2（CTF 约定）。
+/// Build condition_id -> (yes_token_id, no_token_id, merge_amount) from positions, used to deduct exposure after successful merge.
+/// Supports outcome_index 0/1 (0=Yes, 1=No) and 1/2 (CTF convention).
 fn merge_info_with_both_sides(positions: &[Position]) -> HashMap<B256, (U256, U256, Decimal)> {
-    // outcome_index -> (asset, size) 按 condition 分组
+    // outcome_index -> (asset, size) grouped by condition
     let mut by_condition: HashMap<B256, HashMap<i32, (U256, Decimal)>> = HashMap::new();
     for p in positions {
         if p.size <= dec!(0) {
@@ -67,7 +67,7 @@ fn merge_info_with_both_sides(positions: &[Position]) -> HashMap<B256, (U256, U2
     by_condition
         .into_iter()
         .filter_map(|(c, map)| {
-            // 优先使用 CTF 约定 1=Yes, 2=No；否则使用 0=Yes, 1=No
+            // Prefer CTF convention 1=Yes, 2=No; otherwise use 0=Yes, 1=No
             if let (Some((yes_token, yes_size)), Some((no_token, no_size))) =
                 (map.get(&1).copied(), map.get(&2).copied())
             {
@@ -83,9 +83,9 @@ fn merge_info_with_both_sides(positions: &[Position]) -> HashMap<B256, (U256, U2
         .collect()
 }
 
-/// 定时 Merge 任务：每 interval_minutes 分钟拉取**持仓**，仅对 YES+NO 双边都持仓的市场 **串行**执行 merge_max，
-/// 单边持仓跳过；每笔之间间隔、对 RPC 限速做一次重试。Merge 成功后扣减 position_tracker 的持仓与敞口。
-/// 首次执行前短暂延迟，避免与订单簿监听的启动抢占同一 runtime，导致阻塞 stream。
+/// Scheduled merge task: fetches **positions** every interval_minutes, serially executes merge_max only for markets with both YES+NO positions.
+/// Single-side positions are skipped; delays between merges and one retry on RPC rate limits. Deducts position_tracker positions and exposure after successful merge.
+/// Brief initial delay to avoid competing with orderbook stream startup on the same runtime.
 async fn run_merge_task(
     interval_minutes: u64,
     proxy: Address,
@@ -94,19 +94,19 @@ async fn run_merge_task(
     wind_down_in_progress: Arc<AtomicBool>,
 ) {
     let interval = Duration::from_secs(interval_minutes * 60);
-    /// 每笔 merge 之间间隔，降低 RPC  bursts
+    /// Delay between merges to reduce RPC bursts
     const DELAY_BETWEEN_MERGES: Duration = Duration::from_secs(30);
-    /// 遇限速时等待后重试的时长（略大于 "retry in 10s"）
+    /// Backoff duration for rate limit retries (slightly longer than "retry in 10s")
     const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(12);
-    /// 首次执行前延迟，让主循环先完成订单簿订阅并进入 select!，避免 merge 阻塞 stream
+    /// Initial delay to let main loop complete orderbook subscription and enter select!, preventing merge from blocking stream
     const INITIAL_DELAY: Duration = Duration::from_secs(10);
 
-    // 先让主循环完成 get_markets、创建 stream 并进入订单簿监听，再执行第一次 merge
+    // Let main loop complete get_markets, create stream and enter orderbook monitoring before first merge
     sleep(INITIAL_DELAY).await;
 
     loop {
         if wind_down_in_progress.load(Ordering::Relaxed) {
-            info!("收尾进行中，本轮回 merge 跳过");
+            info!("Wind-down in progress, skipping this merge round");
             sleep(interval).await;
             continue;
         }
@@ -116,59 +116,59 @@ async fn run_merge_task(
                 merge_info_with_both_sides(&positions),
             ),
             Err(e) => {
-                warn!(error = %e, "❌ 获取持仓失败，跳过本轮回 merge");
+                warn!(error = %e, "❌ Failed to fetch positions, skipping this merge round");
                 sleep(interval).await;
                 continue;
             }
         };
 
         if condition_ids.is_empty() {
-            debug!("🔄 本轮回 merge: 无满足 YES+NO 双边持仓的市场");
+            debug!("🔄 This merge round: no markets with both YES+NO positions");
         } else {
             info!(
                 count = condition_ids.len(),
-                "🔄 本轮回 merge: 共 {} 个市场满足 YES+NO 双边持仓",
+                "🔄 This merge round: {} markets with both YES+NO positions",
                 condition_ids.len()
             );
         }
 
         for (i, &condition_id) in condition_ids.iter().enumerate() {
-            // 第 2 个及以后的市场：先等 30 秒再 merge，避免与上一笔链上处理重叠
+            // 2nd market onwards: wait 30s before merging to avoid overlapping with previous on-chain processing
             if i > 0 {
-                info!("本轮回 merge: 等待 30 秒后合并下一市场 (第 {}/{} 个)", i + 1, condition_ids.len());
+                info!("Merge round: waiting 30s before next market ({}/{})", i + 1, condition_ids.len());
                 sleep(DELAY_BETWEEN_MERGES).await;
             }
             let mut result = merge::merge_max(condition_id, proxy, &private_key, None).await;
             if result.is_err() {
                 let msg = result.as_ref().unwrap_err().to_string();
                 if msg.contains("rate limit") || msg.contains("retry in") {
-                    warn!(condition_id = %condition_id, "⏳ RPC 限速，等待 {}s 后重试一次", RATE_LIMIT_BACKOFF.as_secs());
+                    warn!(condition_id = %condition_id, "⏳ RPC rate limited, retrying after {}s", RATE_LIMIT_BACKOFF.as_secs());
                     sleep(RATE_LIMIT_BACKOFF).await;
                     result = merge::merge_max(condition_id, proxy, &private_key, None).await;
                 }
             }
             match result {
                 Ok(tx) => {
-                    info!("✅ Merge 完成 | condition_id={:#x}", condition_id);
+                    info!("✅ Merge complete | condition_id={:#x}", condition_id);
                     info!("  📝 tx={}", tx);
-                    // Merge 成功：扣减持仓与风险敞口（先扣敞口再扣持仓，保证 update_exposure_cost 读到的是合并前持仓）
+                    // Merge success: deduct positions and exposure (deduct exposure first to ensure update_exposure_cost reads pre-merge positions)
                     if let Some((yes_token, no_token, merge_amt)) = merge_info.get(&condition_id) {
                         position_tracker.update_exposure_cost(*yes_token, dec!(0), -*merge_amt);
                         position_tracker.update_exposure_cost(*no_token, dec!(0), -*merge_amt);
                         position_tracker.update_position(*yes_token, -*merge_amt);
                         position_tracker.update_position(*no_token, -*merge_amt);
                         info!(
-                            "💰 Merge 已扣减敞口 | condition_id={:#x} | 数量:{}",
+                            "💰 Merge exposure deducted | condition_id={:#x} | amount:{}",
                             condition_id, merge_amt
                         );
                     }
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("无可用份额") {
-                        debug!(condition_id = %condition_id, "⏭️ 跳过 merge: 无可用份额");
+                    if msg.contains("no available shares") {
+                        debug!(condition_id = %condition_id, "⏭️ Skipping merge: no available shares");
                     } else {
-                        warn!(condition_id = %condition_id, error = %e, "❌ Merge 失败");
+                        warn!(condition_id = %condition_id, error = %e, "❌ Merge failed");
                     }
                 }
             }
@@ -181,24 +181,24 @@ async fn run_merge_task(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 安装 rustls CryptoProvider（必须在任何 TLS 连接之前）
+    // Install rustls CryptoProvider (must be before any TLS connection)
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
-    // 初始化日志
+    // Initialize logger
     utils::logger::init_logger()?;
 
-    tracing::info!("Polymarket 5分钟套利机器人启动");
+    tracing::info!("Polymarket 5-minute arbitrage bot started");
 
-    // 许可证校验：须存在有效 license.key，删除许可证将无法运行
+    // License check: valid license.key must exist; deleting the license prevents execution
     poly_5min_bot::trial::check_license()?;
 
-    // 加载配置
+    // Load configuration
     let config = Config::from_env()?;
-    tracing::info!("配置加载完成");
+    tracing::info!("Configuration loaded");
 
-    // 初始化组件（暂时不使用，主循环已禁用）
+    // Initialize components
     let _discoverer = MarketDiscoverer::new(config.crypto_symbols.clone());
     let _scheduler = MarketScheduler::new(_discoverer, config.market_refresh_advance_secs);
     let _detector = ArbitrageDetector::new(config.min_profit_threshold);
@@ -209,25 +209,25 @@ async fn main() -> Result<()> {
 
     if config.dry_run {
         info!("========================================");
-        info!("[DRY RUN] 模拟模式已启用");
-        info!("[DRY RUN] 不会执行真实交易、下单或区块链操作");
+        info!("[DRY RUN] Simulation mode enabled");
+        info!("[DRY RUN] No real trades, orders, or blockchain operations will be executed");
         info!("========================================");
     } else {
-        // 验证私钥格式
-        info!("正在验证私钥格式...");
+        // Validate private key format
+        info!("Validating private key format...");
         let _signer_test = LocalSigner::from_str(&config.private_key)
-            .map_err(|e| anyhow::anyhow!("私钥格式无效: {}", e))?;
-        info!("私钥格式验证通过");
+            .map_err(|e| anyhow::anyhow!("invalid private key format: {}", e))?;
+        info!("Private key format validated");
     }
 
-    // 初始化交易执行器（需要认证）
-    info!("正在初始化交易执行器（需要API认证）...");
+    // Initialize trading executor (requires authentication)
+    info!("Initializing trading executor (requires API authentication)...");
     if let Some(ref proxy) = config.proxy_address {
-        info!(proxy_address = %proxy, "使用Proxy签名类型（Email/Magic或Browser Wallet）");
+        info!(proxy_address = %proxy, "Using Proxy signature type (Email/Magic or Browser Wallet)");
     } else {
-        info!("使用EOA签名类型（直接交易）");
+        info!("Using EOA signature type (direct trading)");
     }
-    info!("注意：如果看到'Could not create api key'警告，这是正常的。SDK会先尝试创建新API key，失败后会自动使用派生方式，认证仍然会成功。");
+    info!("Note: 'Could not create api key' warnings are normal. The SDK first tries to create a new API key, and if that fails, it automatically uses a derived key. Authentication will still succeed.");
     let executor = match TradingExecutor::new(
         config.private_key.clone(),
         config.max_order_size_usdc,
@@ -238,37 +238,37 @@ async fn main() -> Result<()> {
         config.dry_run,
     ).await {
         Ok(exec) => {
-            info!("交易执行器认证成功（可能使用了派生API key）");
+            info!("Trading executor authenticated successfully (may have used derived API key)");
             Arc::new(exec)
         }
         Err(e) => {
-            error!(error = %e, "交易执行器认证失败！无法继续运行。");
-            error!("请检查：");
-            error!("  1. POLYMARKET_PRIVATE_KEY 环境变量是否正确设置");
-            error!("  2. 私钥格式是否正确（应该是64字符的十六进制字符串，不带0x前缀）");
-            error!("  3. 网络连接是否正常");
-            error!("  4. Polymarket API服务是否可用");
-            return Err(anyhow::anyhow!("认证失败，程序退出: {}", e));
+            error!(error = %e, "Trading executor authentication failed! Cannot continue.");
+            error!("Please check:");
+            error!("  1. POLYMARKET_PRIVATE_KEY environment variable is correctly set");
+            error!("  2. Private key format is correct (should be a 64-character hex string without 0x prefix)");
+            error!("  3. Network connection is working");
+            error!("  4. Polymarket API service is available");
+            return Err(anyhow::anyhow!("authentication failed, exiting: {}", e));
         }
     };
 
-    // 创建CLOB客户端用于风险管理（需要认证）
+    // Create CLOB client for risk management (requires authentication)
     use alloy::signers::Signer;
     use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
     use polymarket_client_sdk::clob::types::SignatureType;
 
     let clob_client = if config.dry_run {
-        info!("[DRY RUN] 跳过风险管理客户端认证");
+        info!("[DRY RUN] Skipping risk management client authentication");
         None
     } else {
-        info!("正在初始化风险管理客户端（需要API认证）...");
+        info!("Initializing risk management client (requires API authentication)...");
         let signer_for_risk = LocalSigner::from_str(&config.private_key)?
             .with_chain_id(Some(POLYGON));
         let clob_config = ClobConfig::builder().use_server_time(true).build();
         let mut auth_builder_risk = Client::new("https://clob.polymarket.com", clob_config)?
             .authentication_builder(&signer_for_risk);
 
-        // 如果提供了proxy_address，设置funder和signature_type
+        // If proxy_address is provided, set funder and signature_type
         if let Some(funder) = config.proxy_address {
             auth_builder_risk = auth_builder_risk
                 .funder(funder)
@@ -277,25 +277,25 @@ async fn main() -> Result<()> {
 
         match auth_builder_risk.authenticate().await {
             Ok(client) => {
-                info!("风险管理客户端认证成功（可能使用了派生API key）");
+                info!("Risk management client authenticated successfully (may have used derived API key)");
                 Some(client)
             }
             Err(e) => {
-                error!(error = %e, "风险管理客户端认证失败！无法继续运行。");
-                error!("请检查：");
-                error!("  1. POLYMARKET_PRIVATE_KEY 环境变量是否正确设置");
-                error!("  2. 私钥格式是否正确");
-                error!("  3. 网络连接是否正常");
-                error!("  4. Polymarket API服务是否可用");
-                return Err(anyhow::anyhow!("认证失败，程序退出: {}", e));
+                error!(error = %e, "Risk management client authentication failed! Cannot continue.");
+                error!("Please check:");
+                error!("  1. POLYMARKET_PRIVATE_KEY environment variable is correctly set");
+                error!("  2. Private key format is correct");
+                error!("  3. Network connection is working");
+                error!("  4. Polymarket API service is available");
+                return Err(anyhow::anyhow!("authentication failed, exiting: {}", e));
             }
         }
     };
 
     let _risk_manager = Arc::new(RiskManager::new(clob_client.clone(), &config));
 
-    // 创建对冲监测器（传入PositionTracker的Arc引用以更新风险敞口）
-    // 对冲策略已暂时关闭，但保留hedge_monitor变量以备将来使用
+    // Create hedge monitor (pass PositionTracker Arc reference for updating risk exposure)
+    // Hedging strategy is temporarily disabled, but hedge_monitor variable is retained for future use
     let position_tracker = _risk_manager.position_tracker();
     let _hedge_monitor = HedgeMonitor::new(
         clob_client.clone(),
@@ -305,28 +305,28 @@ async fn main() -> Result<()> {
     );
 
     if !config.dry_run {
-        // 验证认证是否真的成功 - 尝试一个简单的API调用
-        info!("正在验证认证状态（通过API调用测试）...");
+        // Verify authentication actually succeeded - try a simple API call
+        info!("Verifying authentication status (via API call test)...");
         match executor.verify_authentication().await {
             Ok(_) => {
-                info!("✅ 认证验证成功，API调用正常");
+                info!("✅ Authentication verified, API calls working");
             }
             Err(e) => {
-                error!(error = %e, "❌ 认证验证失败！虽然authenticate()没有报错，但API调用失败。");
-                error!("这表明认证实际上没有成功，可能是：");
-                error!("  1. API密钥创建失败（看到'Could not create api key'警告）");
-                error!("  2. 私钥对应的账户可能没有在Polymarket上注册");
-                error!("  3. 账户可能被限制或暂停");
-                error!("  4. 网络连接问题");
-                error!("程序将退出，请解决认证问题后再运行。");
-                return Err(anyhow::anyhow!("认证验证失败: {}", e));
+                error!(error = %e, "❌ Authentication verification failed! authenticate() succeeded but API call failed.");
+                error!("This indicates authentication did not actually succeed, possibly because:");
+                error!("  1. API key creation failed (saw 'Could not create api key' warning)");
+                error!("  2. The account for this private key may not be registered on Polymarket");
+                error!("  3. The account may be restricted or suspended");
+                error!("  4. Network connection issues");
+                error!("Program will exit. Please resolve authentication issues before running again.");
+                return Err(anyhow::anyhow!("authentication verification failed: {}", e));
             }
         }
     }
 
-    info!("✅ 所有组件初始化完成{}", if config.dry_run { " [DRY RUN]" } else { "，认证验证通过" });
+    info!("✅ All components initialized{}", if config.dry_run { " [DRY RUN]" } else { ", authentication verified" });
 
-    // RPC 健康检查组件（端点探测、熔断、指标）
+    // RPC health check components (endpoint probing, circuit breaker, metrics)
     let rpc_cfg = rpc_check::CheckConfig::builder()
         .timeout(Duration::from_secs(5))
         .build();
@@ -336,15 +336,15 @@ async fn main() -> Result<()> {
     let _ = _rpc_checker.validate_endpoint("https://clob.polymarket.com");
     let _ = _rpc_checker.validate_endpoint("https://gamma-api.polymarket.com");
 
-    // 创建仓位平衡器
+    // Create position balancer
     let position_balancer = Arc::new(PositionBalancer::new(
         clob_client.clone(),
         _risk_manager.position_tracker(),
         &config,
     ));
 
-    // 定时持仓同步任务：每N秒从API获取最新持仓，覆盖本地缓存
-    // Dry run 模式下禁用，持仓通过模拟成交跟踪
+    // Scheduled position sync task: fetch latest positions from API every N seconds, overwrite local cache
+    // Disabled in dry run mode, positions are tracked via simulated fills
     let position_sync_interval = config.position_sync_interval_secs;
     if position_sync_interval > 0 && !config.dry_run {
         let position_tracker_sync = _risk_manager.position_tracker();
@@ -353,10 +353,10 @@ async fn main() -> Result<()> {
             loop {
                 match position_tracker_sync.sync_from_api().await {
                     Ok(_) => {
-                        // 持仓信息已在 sync_from_api 中打印
+                        // Position info already printed in sync_from_api
                     }
                     Err(e) => {
-                        warn!(error = %e, "持仓同步失败，将在下次循环重试");
+                        warn!(error = %e, "Position sync failed, will retry next cycle");
                     }
                 }
                 sleep(interval).await;
@@ -364,35 +364,35 @@ async fn main() -> Result<()> {
         });
         info!(
             interval_secs = position_sync_interval,
-            "已启动定时持仓同步任务，每 {} 秒从API获取最新持仓覆盖本地缓存",
+            "Started scheduled position sync task, fetching latest positions from API every {} seconds",
             position_sync_interval
         );
     } else {
-        warn!("POSITION_SYNC_INTERVAL_SECS=0，持仓同步已禁用");
+        warn!("POSITION_SYNC_INTERVAL_SECS=0, position sync disabled");
     }
 
-    // 定时仓位平衡任务：每N秒检查持仓和挂单，取消多余挂单
-    // 注意：由于需要市场映射，平衡任务将在主循环中调用
+    // Scheduled position balance task: check positions and pending orders every N seconds, cancel excess orders
+    // Note: balance task is called in main loop since it requires market mapping
     let balance_interval = config.position_balance_interval_secs;
     if balance_interval > 0 {
         info!(
             interval_secs = balance_interval,
-            "仓位平衡任务将在主循环中每 {} 秒执行一次",
+            "Position balance task will execute every {} seconds in main loop",
             balance_interval
         );
     } else {
-        info!("定时仓位平衡未启用（POSITION_BALANCE_INTERVAL_SECS=0）");
+        info!("Scheduled position balance not enabled (POSITION_BALANCE_INTERVAL_SECS=0)");
     }
 
-    // 收尾进行中标志：定时 merge 会检查并跳过，避免与收尾 merge 竞争
+    // Wind-down in progress flag: scheduled merge checks this and skips to avoid competing with wind-down merge
     let wind_down_in_progress = Arc::new(AtomicBool::new(false));
 
-    // 两次套利交易之间的最小间隔
+    // Minimum interval between two arbitrage trades
     const MIN_TRADE_INTERVAL: Duration = Duration::from_secs(3);
     let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> = Arc::new(tokio::sync::Mutex::new(None));
 
-    // 定时 Merge：每 N 分钟根据持仓执行 merge，仅对 YES+NO 双边都持仓的市场
-    // Dry run 模式下禁用 merge（需要区块链交互）
+    // Scheduled merge: execute merge every N minutes based on positions, only for markets with both YES+NO positions
+    // Disabled in dry run mode (requires blockchain interaction)
     let merge_interval = config.merge_interval_minutes;
     if merge_interval > 0 && !config.dry_run {
         if let Some(proxy) = config.proxy_address {
@@ -404,35 +404,35 @@ async fn main() -> Result<()> {
             });
             info!(
                 interval_minutes = merge_interval,
-                "已启动定时 Merge 任务，每 {} 分钟根据持仓执行（仅 YES+NO 双边）",
+                "Started scheduled merge task, executing every {} minutes based on positions (both YES+NO only)",
                 merge_interval
             );
         } else {
-            warn!("MERGE_INTERVAL_MINUTES={} 但未设置 POLYMARKET_PROXY_ADDRESS，定时 Merge 已禁用", merge_interval);
+            warn!("MERGE_INTERVAL_MINUTES={} but POLYMARKET_PROXY_ADDRESS not set, scheduled merge disabled", merge_interval);
         }
     } else {
-        info!("定时 Merge 未启用（MERGE_INTERVAL_MINUTES=0），如需启用请在 .env 中设置 MERGE_INTERVAL_MINUTES 为正数，例如 5 或 15");
+        info!("Scheduled merge not enabled (MERGE_INTERVAL_MINUTES=0). To enable, set MERGE_INTERVAL_MINUTES to a positive number in .env, e.g. 5 or 15");
     }
 
-    // 主循环已启用，开始监控和交易
+    // Main loop enabled, start monitoring and trading
     #[allow(unreachable_code)]
     loop {
-        // 立即获取当前窗口的市场，如果失败则等待下一个窗口
+        // Immediately fetch current window markets, wait for next window on failure
         let markets = match _scheduler.get_markets_immediately_or_wait().await {
             Ok(markets) => markets,
             Err(e) => {
-                error!(error = %e, "获取市场失败");
+                error!(error = %e, "Failed to fetch markets");
                 sleep(Duration::from_secs(60)).await;
                 continue;
             }
         };
 
         if markets.is_empty() {
-            warn!("未找到任何市场，跳过当前窗口");
+            warn!("No markets found, skipping current window");
             continue;
         }
 
-        // RPC 端点健康检查（主循环前批量探测）
+        // RPC endpoint health check (batch probing before main loop)
         let _ep_validator = rpc_check::EndpointValidator::new();
         let _ = _ep_validator.normalize("https://clob.polymarket.com");
         let _status = _rpc_checker.perform_health_check_sync("https://clob.polymarket.com");
@@ -442,31 +442,31 @@ async fn main() -> Result<()> {
             _rpc_metrics.record_check(true);
         }
 
-        // 新一轮开始：重置风险敞口，使本轮从 0 敞口重新累计
+        // New round start: reset risk exposure, accumulate from 0 this round
         _risk_manager.position_tracker().reset_exposure();
 
-        // 初始化订单簿监控器
+        // Initialize orderbook monitor
         let mut monitor = OrderBookMonitor::new();
 
-        // 订阅所有市场
+        // Subscribe to all markets
         for market in &markets {
             if let Err(e) = monitor.subscribe_market(market) {
-                error!(error = %e, market_id = %market.market_id, "订阅市场失败");
+                error!(error = %e, market_id = %market.market_id, "Failed to subscribe to market");
             }
         }
 
-        // 创建订单簿流
+        // Create orderbook stream
         let mut stream = match monitor.create_orderbook_stream() {
             Ok(stream) => stream,
             Err(e) => {
-                error!(error = %e, "创建订单簿流失败");
+                error!(error = %e, "Failed to create orderbook stream");
                 continue;
             }
         };
 
-        info!(market_count = markets.len(), "开始监控订单簿");
+        info!(market_count = markets.len(), "Starting orderbook monitoring");
 
-        // 记录当前窗口的时间戳，用于检测周期切换与收尾触发
+        // Record current window timestamp for detecting cycle switch and wind-down trigger
         use chrono::Utc;
         use crate::market::discoverer::FIVE_MIN_SECS;
         let current_window_timestamp = MarketDiscoverer::calculate_current_window_timestamp(Utc::now());
@@ -474,60 +474,60 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| Utc::now());
         let mut wind_down_done = false;
 
-        // 创建市场ID到市场信息的映射
+        // Create market ID to market info mapping
         let market_map: HashMap<B256, &MarketInfo> = markets.iter()
             .map(|m| (m.market_id, m))
             .collect();
 
-        // 创建市场映射（condition_id -> (yes_token_id, no_token_id)）用于仓位平衡
+        // Create market mapping (condition_id -> (yes_token_id, no_token_id)) for position balancing
         let market_token_map: HashMap<B256, (U256, U256)> = markets.iter()
             .map(|m| (m.market_id, (m.yes_token_id, m.no_token_id)))
             .collect();
 
-        // 创建定时仓位平衡定时器
+        // Create scheduled position balance timer
         let balance_interval = config.position_balance_interval_secs;
         let mut balance_timer = if balance_interval > 0 {
             let mut timer = tokio::time::interval(Duration::from_secs(balance_interval));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            timer.tick().await; // 立即触发第一次
+            timer.tick().await; // Trigger first tick immediately
             Some(timer)
         } else {
             None
         };
 
-        // 按市场记录上一拍卖一价，用于计算涨跌方向（仅一次 HashMap 读写，不影响监控性能）
+        // Track previous best ask per market for price direction (single HashMap read/write, no performance impact)
         let last_prices: DashMap<B256, (Decimal, Decimal)> = DashMap::new();
 
-        // 监控订单簿更新
+        // Monitor orderbook updates
         loop {
-            // 收尾检查：距窗口结束 <= N 分钟时执行一次收尾（不跳出，继续监控直到窗口结束由下方「新窗口检测」自然切换）
-            // 使用秒级精度，5分钟窗口下 num_minutes() 截断可能导致漏检
+            // Wind-down check: execute once when <= N minutes until window end (don't break, continue monitoring until window switch below)
+            // Use second-level precision, num_minutes() truncation may miss in 5-minute windows
             if config.wind_down_before_window_end_minutes > 0 && !wind_down_done {
                 let now = Utc::now();
                 let seconds_until_end = (window_end - now).num_seconds();
                 let threshold_seconds = config.wind_down_before_window_end_minutes as i64 * 60;
                 if seconds_until_end <= threshold_seconds {
-                    info!("🛑 触发收尾 | 距窗口结束 {} 秒{}", seconds_until_end, if config.dry_run { " [DRY RUN]" } else { "" });
+                    info!("🛑 Wind-down triggered | {} seconds until window end{}", seconds_until_end, if config.dry_run { " [DRY RUN]" } else { "" });
                     wind_down_done = true;
                     wind_down_in_progress.store(true, Ordering::Relaxed);
 
                     if config.dry_run {
-                        // Dry run: 仅记录日志，模拟扣减持仓
+                        // Dry run: log only, simulate position deduction
                         let position_tracker = _risk_manager.position_tracker();
-                        info!("[DRY RUN] 收尾：模拟取消所有挂单");
-                        info!("[DRY RUN] 收尾：模拟 Merge 双边持仓");
-                        // 模拟 merge 扣减：遍历所有 token 持仓，将成对的持仓扣减
+                        info!("[DRY RUN] Wind-down: simulating cancel all pending orders");
+                        info!("[DRY RUN] Wind-down: simulating merge of both-side positions");
+                        // Simulate merge deduction: iterate all token positions, deduct paired positions
                         let all_positions = position_tracker.get_all_positions();
                         for (token_id, size) in &all_positions {
                             if *size > dec!(0) {
-                                info!("[DRY RUN] 收尾：模拟卖出 | token_id={:#x} | 数量:{}", token_id, size);
+                                info!("[DRY RUN] Wind-down: simulated sell | token_id={:#x} | size:{}", token_id, size);
                             }
                         }
                         position_tracker.reset_exposure();
-                        info!("[DRY RUN] 收尾完成，已重置风险敞口");
+                        info!("[DRY RUN] Wind-down complete, risk exposure reset");
                         wind_down_in_progress.store(false, Ordering::Relaxed);
                     } else {
-                    // 收尾在独立任务中执行，不阻塞订单簿；各市场 merge 之间间隔 30 秒
+                    // Wind-down runs in separate task, not blocking orderbook; 30s interval between market merges
                     let executor_wd = executor.clone();
                     let config_wd = config.clone();
                     let risk_manager_wd = _risk_manager.clone();
@@ -535,18 +535,18 @@ async fn main() -> Result<()> {
                     tokio::spawn(async move {
                         const MERGE_INTERVAL: Duration = Duration::from_secs(30);
 
-                        // 1. 取消所有挂单
+                        // 1. Cancel all pending orders
                         if let Err(e) = executor_wd.cancel_all_orders().await {
-                            warn!(error = %e, "收尾：取消所有挂单失败，继续执行 Merge 与卖出");
+                            warn!(error = %e, "Wind-down: failed to cancel all orders, continuing with merge and sell");
                         } else {
-                            info!("✅ 收尾：已取消所有挂单");
+                            info!("✅ Wind-down: all pending orders cancelled");
                         }
 
-                        // 取消后等 10 秒再 Merge，避免取消前刚成交的订单尚未上链更新持仓
+                        // Wait 10s after cancel before merge, to allow recently filled orders to update on-chain
                         const DELAY_AFTER_CANCEL: Duration = Duration::from_secs(10);
                         sleep(DELAY_AFTER_CANCEL).await;
 
-                        // 2. Merge 双边持仓（每完成一个市场后等 30 秒再合并下一个）并更新敞口
+                        // 2. Merge both-side positions (wait 30s between markets) and update exposure
                         let position_tracker = risk_manager_wd.position_tracker();
                         let mut did_any_merge = false;
                         if let Some(proxy) = config_wd.proxy_address {
@@ -559,58 +559,58 @@ async fn main() -> Result<()> {
                                         match merge::merge_max(*condition_id, proxy, &config_wd.private_key, None).await {
                                             Ok(tx) => {
                                                 did_any_merge = true;
-                                                info!("✅ 收尾：Merge 完成 | condition_id={:#x} | tx={}", condition_id, tx);
+                                                info!("✅ Wind-down: merge complete | condition_id={:#x} | tx={}", condition_id, tx);
                                                 if let Some((yes_token, no_token, merge_amt)) = merge_info.get(condition_id) {
                                                     position_tracker.update_exposure_cost(*yes_token, dec!(0), -*merge_amt);
                                                     position_tracker.update_exposure_cost(*no_token, dec!(0), -*merge_amt);
                                                     position_tracker.update_position(*yes_token, -*merge_amt);
                                                     position_tracker.update_position(*no_token, -*merge_amt);
-                                                    info!("💰 收尾：Merge 已扣减敞口 | condition_id={:#x} | 数量:{}", condition_id, merge_amt);
+                                                    info!("💰 Wind-down: merge exposure deducted | condition_id={:#x} | amount:{}", condition_id, merge_amt);
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(condition_id = %condition_id, error = %e, "收尾：Merge 失败");
+                                                warn!(condition_id = %condition_id, error = %e, "Wind-down: merge failed");
                                             }
                                         }
-                                        // 每完成一个市场的 merge 后等 30 秒再处理下一个，给链上时间
+                                        // Wait 30s after each market merge before processing next one, allowing on-chain time
                                         if i + 1 < n {
-                                            info!("收尾：等待 30 秒后合并下一市场");
+                                            info!("Wind-down: waiting 30s before merging next market");
                                             sleep(MERGE_INTERVAL).await;
                                         }
                                     }
                                 }
-                                Err(e) => { warn!(error = %e, "收尾：获取持仓失败，跳过 Merge"); }
+                                Err(e) => { warn!(error = %e, "Wind-down: failed to fetch positions, skipping merge"); }
                             }
                         } else {
-                            warn!("收尾：未配置 POLYMARKET_PROXY_ADDRESS，跳过 Merge");
+                            warn!("Wind-down: POLYMARKET_PROXY_ADDRESS not set, skipping merge");
                         }
 
-                        // 若有执行过 Merge，等半分钟再卖出单腿，给链上处理时间；无 Merge 则不等
+                        // If any merges were executed, wait 30s before selling single legs for on-chain processing time; no wait if no merges
                         if did_any_merge {
                             sleep(MERGE_INTERVAL).await;
                         }
 
-                        // 3. 市价卖出剩余单腿持仓
+                        // 3. Market sell remaining single-leg positions
                         let wind_down_sell_price = Decimal::try_from(config_wd.wind_down_sell_price).unwrap_or(dec!(0.01));
                         match get_positions().await {
                             Ok(positions) => {
                                 for pos in positions.iter().filter(|p| p.size > dec!(0)) {
                                     let size_floor = (pos.size * dec!(100)).floor() / dec!(100);
                                     if size_floor < dec!(0.01) {
-                                        debug!(token_id = %pos.asset, size = %pos.size, "收尾：持仓过小，跳过卖出");
+                                        debug!(token_id = %pos.asset, size = %pos.size, "Wind-down: position too small, skipping sell");
                                         continue;
                                     }
                                     if let Err(e) = executor_wd.sell_at_price(pos.asset, wind_down_sell_price, size_floor).await {
-                                        warn!(token_id = %pos.asset, size = %pos.size, error = %e, "收尾：卖出单腿失败");
+                                        warn!(token_id = %pos.asset, size = %pos.size, error = %e, "Wind-down: failed to sell single leg");
                                     } else {
-                                        info!("✅ 收尾：已下卖单 | token_id={:#x} | 数量:{} | 价格:{:.4}", pos.asset, size_floor, wind_down_sell_price);
+                                        info!("✅ Wind-down: sell order placed | token_id={:#x} | size:{} | price:{:.4}", pos.asset, size_floor, wind_down_sell_price);
                                     }
                                 }
                             }
-                            Err(e) => { warn!(error = %e, "收尾：获取持仓失败，跳过卖出"); }
+                            Err(e) => { warn!(error = %e, "Wind-down: failed to fetch positions, skipping sell"); }
                         }
 
-                        info!("🛑 收尾完成，继续监控至窗口结束");
+                        info!("🛑 Wind-down complete, continuing to monitor until window ends");
                         wind_down_flag.store(false, Ordering::Relaxed);
                     });
                     } // end else !dry_run
@@ -618,19 +618,19 @@ async fn main() -> Result<()> {
             }
 
             tokio::select! {
-                // 处理订单簿更新
+                // Process orderbook updates
                 book_result = stream.next() => {
                     match book_result {
                         Some(Ok(book)) => {
-                            // 然后处理订单簿更新（book会被move）
+                            // Process orderbook update (book will be moved)
                             if let Some(pair) = monitor.handle_book_update(book) {
-                                // 注意：asks 最后一个为卖一价
+                                // Note: last element of asks is the best ask price
                                 let yes_best_ask = pair.yes_book.asks.last().map(|a| (a.price, a.size));
                                 let no_best_ask = pair.no_book.asks.last().map(|a| (a.price, a.size));
                                 let total_ask_price = yes_best_ask.and_then(|(p, _)| no_best_ask.map(|(np, _)| p + np));
 
                                 let market_id = pair.market_id;
-                                // 与上一拍比较得到涨跌方向（↑涨 ↓跌 −平），首拍无箭头
+                                // Compare with previous tick for price direction (↑up ↓down −flat), no arrow on first tick
                                 let (yes_dir, no_dir) = match (yes_best_ask, no_best_ask) {
                                     (Some((yp, _)), Some((np, _))) => {
                                         let prev = last_prices.get(&market_id).map(|r| (r.0, r.1));
@@ -647,10 +647,10 @@ async fn main() -> Result<()> {
                                 };
 
                                 let market_info = market_map.get(&pair.market_id);
-                                let market_title = market_info.map(|m| m.title.as_str()).unwrap_or("未知市场");
+                                let market_title = market_info.map(|m| m.title.as_str()).unwrap_or("unknown market");
                                 let market_symbol = market_info.map(|m| m.crypto_symbol.as_str()).unwrap_or("");
                                 let market_display = if !market_symbol.is_empty() {
-                                    format!("{}预测市场", market_symbol)
+                                    format!("{} prediction market", market_symbol)
                                 } else {
                                     market_title.to_string()
                                 };
@@ -659,52 +659,63 @@ async fn main() -> Result<()> {
                                     .map(|t| {
                                         if t < dec!(1.0) {
                                             let profit_pct = (dec!(1.0) - t) * dec!(100.0);
-                                            ("🚨套利机会", format!("总价:{:.4} 利润:{:.2}%", t, profit_pct))
+                                            ("🚨Arb opportunity", format!("total:{:.4} profit:{:.2}%", t, profit_pct))
                                         } else {
-                                            ("📊", format!("总价:{:.4} (无套利)", t))
+                                            ("📊", format!("total:{:.4} (no arb)", t))
                                         }
                                     })
-                                    .unwrap_or_else(|| ("📊", "无数据".to_string()));
+                                    .unwrap_or_else(|| ("📊", "no data".to_string()));
 
-                                // 涨跌箭头仅在套利机会时显示
-                                let is_arbitrage = prefix == "🚨套利机会";
+                                // Direction arrows only shown during arbitrage opportunities
+                                let is_arbitrage = prefix == "🚨Arb opportunity";
                                 let yes_info = yes_best_ask
                                     .map(|(p, s)| {
                                         if is_arbitrage && !yes_dir.is_empty() {
-                                            format!("Yes:{:.4} 份额:{} {}", p, s, yes_dir)
+                                            format!("Yes:{:.4} size:{} {}", p, s, yes_dir)
                                         } else {
-                                            format!("Yes:{:.4} 份额:{}", p, s)
+                                            format!("Yes:{:.4} size:{}", p, s)
                                         }
                                     })
-                                    .unwrap_or_else(|| "Yes:无".to_string());
+                                    .unwrap_or_else(|| "Yes:N/A".to_string());
                                 let no_info = no_best_ask
                                     .map(|(p, s)| {
                                         if is_arbitrage && !no_dir.is_empty() {
-                                            format!("No:{:.4} 份额:{} {}", p, s, no_dir)
+                                            format!("No:{:.4} size:{} {}", p, s, no_dir)
                                         } else {
-                                            format!("No:{:.4} 份额:{}", p, s)
+                                            format!("No:{:.4} size:{}", p, s)
                                         }
                                     })
-                                    .unwrap_or_else(|| "No:无".to_string());
+                                    .unwrap_or_else(|| "No:N/A".to_string());
 
-                                info!(
-                                    "{} {} | {} | {} | {}",
-                                    prefix,
-                                    market_display,
-                                    yes_info,
-                                    no_info,
-                                    spread_info
-                                );
+                                if is_arbitrage {
+                                    info!(
+                                        "{} {} | {} | {} | {}",
+                                        prefix,
+                                        market_display,
+                                        yes_info,
+                                        no_info,
+                                        spread_info
+                                    );
+                                } else {
+                                    debug!(
+                                        "{} {} | {} | {} | {}",
+                                        prefix,
+                                        market_display,
+                                        yes_info,
+                                        no_info,
+                                        spread_info
+                                    );
+                                }
                                 
-                                // 保留原有的结构化日志用于调试（可选）
+                                // Retain original structured logging for debugging (optional)
                                 debug!(
                                     market_id = %pair.market_id,
                                     yes_token = %pair.yes_book.asset_id,
                                     no_token = %pair.no_book.asset_id,
-                                    "订单簿对详细信息"
+                                    "Orderbook pair details"
                                 );
 
-                                // 检测套利机会（监控阶段：只有当总价 <= 1 - 套利执行价差 时才执行套利）
+                                // Detect arbitrage opportunity (monitoring phase: only execute when total price <= 1 - arbitrage execution spread)
                                 use rust_decimal::Decimal;
                                 let execution_threshold = dec!(1.0) - Decimal::try_from(config.arbitrage_execution_spread)
                                     .unwrap_or(dec!(0.01));
@@ -715,40 +726,40 @@ async fn main() -> Result<()> {
                                             &pair.no_book,
                                             &pair.market_id,
                                         ) {
-                                            // 检查 YES 价格是否达到阈值
+                                            // Check if YES price meets threshold
                                             if config.min_yes_price_threshold > 0.0 {
                                                 use rust_decimal::Decimal;
                                                 let min_yes_price_decimal = Decimal::try_from(config.min_yes_price_threshold)
                                                     .unwrap_or(dec!(0.0));
                                                 if opp.yes_ask_price < min_yes_price_decimal {
                                                     debug!(
-                                                        "⏸️ YES价格未达到阈值，跳过套利执行 | 市场:{} | YES价格:{:.4} | 阈值:{:.4}",
+                                                        "⏸️ YES price below threshold, skipping arbitrage | market:{} | YES price:{:.4} | threshold:{:.4}",
                                                         market_display,
                                                         opp.yes_ask_price,
                                                         config.min_yes_price_threshold
                                                     );
-                                                    continue; // 跳过这个套利机会
+                                                    continue; // Skip this arbitrage opportunity
                                                 }
                                             }
-                                            
-                                            // 检查 NO 价格是否达到阈值
+
+                                            // Check if NO price meets threshold
                                             if config.min_no_price_threshold > 0.0 {
                                                 use rust_decimal::Decimal;
                                                 let min_no_price_decimal = Decimal::try_from(config.min_no_price_threshold)
                                                     .unwrap_or(dec!(0.0));
                                                 if opp.no_ask_price < min_no_price_decimal {
                                                     debug!(
-                                                        "⏸️ NO价格未达到阈值，跳过套利执行 | 市场:{} | NO价格:{:.4} | 阈值:{:.4}",
+                                                        "⏸️ NO price below threshold, skipping arbitrage | market:{} | NO price:{:.4} | threshold:{:.4}",
                                                         market_display,
                                                         opp.no_ask_price,
                                                         config.min_no_price_threshold
                                                     );
-                                                    continue; // 跳过这个套利机会
+                                                    continue; // Skip this arbitrage opportunity
                                                 }
                                             }
-                                            
-                                            // 检查是否接近市场结束时间（如果配置了停止时间）
-                                            // 使用秒级精度，5分钟市场下 num_minutes() 截断可能导致漏检
+
+                                            // Check if approaching market end time (if stop time configured)
+                                            // Use second-level precision, num_minutes() truncation may miss in 5-minute markets
                                             if config.stop_arbitrage_before_end_minutes > 0 {
                                                 if let Some(market_info) = market_map.get(&pair.market_id) {
                                                     use chrono::Utc;
@@ -759,18 +770,18 @@ async fn main() -> Result<()> {
                                                     
                                                     if seconds_until_end <= threshold_seconds {
                                                         debug!(
-                                                            "⏰ 接近市场结束时间，跳过套利执行 | 市场:{} | 距离结束:{}秒 | 停止阈值:{}分钟",
+                                                            "⏰ Approaching market end time, skipping arbitrage | market:{} | time until end:{}s | stop threshold:{} min",
                                                             market_display,
                                                             seconds_until_end,
                                                             config.stop_arbitrage_before_end_minutes
                                                         );
-                                                        continue; // 跳过这个套利机会
+                                                        continue; // Skip this arbitrage opportunity
                                                     }
                                                 }
                                             }
                                             
-                                            // 计算订单成本（USD）
-                                            // 使用套利机会中的实际可用数量，但不超过配置的最大订单大小
+                                            // Calculate order cost (USD)
+                                            // Use actual available size from arbitrage opportunity, capped at configured max order size
                                             use rust_decimal::Decimal;
                                             let max_order_size = Decimal::try_from(config.max_order_size_usdc).unwrap_or(dec!(100.0));
                                             let order_size = opp.yes_size.min(opp.no_size).min(max_order_size);
@@ -778,31 +789,31 @@ async fn main() -> Result<()> {
                                             let no_cost = opp.no_ask_price * order_size;
                                             let total_cost = yes_cost + no_cost;
                                             
-                                            // 检查风险敞口限制
+                                            // Check risk exposure limit
                                             let position_tracker = _risk_manager.position_tracker();
                                             let current_exposure = position_tracker.calculate_exposure();
                                             
                                             if position_tracker.would_exceed_limit(yes_cost, no_cost) {
                                                 warn!(
-                                                    "⚠️ 风险敞口超限，拒绝执行套利交易 | 市场:{} | 当前敞口:{:.2} USD | 订单成本:{:.2} USD | 限制:{:.2} USD",
+                                                    "⚠️ Risk exposure exceeded, rejecting arbitrage | market:{} | current exposure:{:.2} USD | order cost:{:.2} USD | limit:{:.2} USD",
                                                     market_display,
                                                     current_exposure,
                                                     total_cost,
                                                     position_tracker.max_exposure()
                                                 );
-                                                continue; // 跳过这个套利机会
+                                                continue; // Skip this arbitrage opportunity
                                             }
-                                            
-                                            // 检查持仓平衡（使用本地缓存，零延迟）
+
+                                            // Check position balance (using local cache, zero latency)
                                             if position_balancer.should_skip_arbitrage(opp.yes_token_id, opp.no_token_id) {
                                                 warn!(
-                                                    "⚠️ 持仓已严重不平衡，跳过套利执行 | 市场:{}",
+                                                    "⚠️ Position severely imbalanced, skipping arbitrage | market:{}",
                                                     market_display
                                                 );
-                                                continue; // 跳过这个套利机会
+                                                continue; // Skip this arbitrage opportunity
                                             }
-                                            
-                                            // 检查交易间隔：两次交易间隔不少于 3 秒
+
+                                            // Check trade interval: at least 3 seconds between trades
                                             {
                                                 let mut guard = last_trade_time.lock().await;
                                                 let now = Instant::now();
@@ -810,46 +821,46 @@ async fn main() -> Result<()> {
                                                     if now.saturating_duration_since(last) < MIN_TRADE_INTERVAL {
                                                         let elapsed = now.saturating_duration_since(last).as_secs_f32();
                                                         debug!(
-                                                            "⏱️ 交易间隔不足 3 秒，跳过 | 市场:{} | 距上次:{}秒",
+                                                            "⏱️ Trade interval less than 3s, skipping | market:{} | since last:{}s",
                                                             market_display,
                                                             elapsed
                                                         );
-                                                        continue; // 跳过此套利机会
+                                                        continue; // Skip this arbitrage opportunity
                                                     }
                                                 }
                                                 *guard = Some(now);
                                             }
 
                                             info!(
-                                                "⚡ 执行套利交易 | 市场:{} | 利润:{:.2}% | 下单数量:{}份 | 订单成本:{:.2} USD | 当前敞口:{:.2} USD",
+                                                "⚡ Executing arbitrage | market:{} | profit:{:.2}% | order size:{} | order cost:{:.2} USD | current exposure:{:.2} USD",
                                                 market_display,
                                                 opp.profit_percentage,
                                                 order_size,
                                                 total_cost,
                                                 current_exposure
                                             );
-                                            // 简化敞口：只要执行套利就增加敞口，不管是否成交
+                                            // Simplified exposure: increase exposure on arbitrage execution regardless of fill
                                             let _pt = _risk_manager.position_tracker();
                                             _pt.update_exposure_cost(opp.yes_token_id, opp.yes_ask_price, order_size);
                                             _pt.update_exposure_cost(opp.no_token_id, opp.no_ask_price, order_size);
                                             
-                                            // 套利执行：只要总价 <= 阈值即执行，不因涨跌组合跳过；涨跌仅用于滑点分配（仅下降=second，上涨与持平=first）
-                                            // 克隆需要的变量到独立任务中（涨跌方向用于按方向分配滑点）
+                                            // Arbitrage execution: execute as long as total price <= threshold, don't skip based on direction; direction only used for slippage allocation (down=second, up/flat=first)
+                                            // Clone required variables into independent task (direction used for direction-based slippage allocation)
                                             let executor_clone = executor.clone();
                                             let risk_manager_clone = _risk_manager.clone();
                                             let opp_clone = opp.clone();
                                             let yes_dir_s = yes_dir.to_string();
                                             let no_dir_s = no_dir.to_string();
                                             
-                                            // 使用 tokio::spawn 异步执行套利交易，不阻塞订单簿更新处理
+                                            // Use tokio::spawn for async arbitrage execution, non-blocking for orderbook updates
                                             tokio::spawn(async move {
-                                                // 执行套利交易（滑点：仅下降=second，上涨与持平=first）
+                                                // Execute arbitrage (slippage: down=second, up/flat=first)
                                                 match executor_clone.execute_arbitrage_pair(&opp_clone, &yes_dir_s, &no_dir_s).await {
                                                     Ok(result) => {
-                                                        // 先保存 pair_id，因为 result 会被移动
+                                                        // Save pair_id first, as result will be moved
                                                         let pair_id = result.pair_id.clone();
                                                         
-                                                        // 注册到风险管理器（传入价格信息以计算风险敞口）
+                                                        // Register with risk manager (pass price info for risk exposure calculation)
                                                         risk_manager_clone.register_order_pair(
                                                             result,
                                                             opp_clone.market_id,
@@ -859,40 +870,40 @@ async fn main() -> Result<()> {
                                                             opp_clone.no_ask_price,
                                                         );
 
-                                                        // 处理风险恢复
-                                                        // 对冲策略已暂时关闭，买进单边不做任何处理
+                                                        // Handle risk recovery
+                                                        // Hedging strategy temporarily disabled, no action for single-side fills
                                                         match risk_manager_clone.handle_order_pair(&pair_id).await {
                                                             Ok(action) => {
-                                                                // 对冲策略已关闭，不再处理MonitorForExit和SellExcess
+                                                                // Hedging strategy disabled, no longer processing MonitorForExit and SellExcess
                                                                 match action {
                                                                     crate::risk::recovery::RecoveryAction::None => {
-                                                                        // 正常情况，无需处理
+                                                                        // Normal case, no action needed
                                                                     }
                                                                     crate::risk::recovery::RecoveryAction::MonitorForExit { .. } => {
-                                                                        info!("单边成交，但对冲策略已关闭，不做处理");
+                                                                        info!("Single-side fill, but hedging strategy disabled, no action taken");
                                                                     }
                                                                     crate::risk::recovery::RecoveryAction::SellExcess { .. } => {
-                                                                        info!("部分成交不平衡，但对冲策略已关闭，不做处理");
+                                                                        info!("Partial fill imbalance, but hedging strategy disabled, no action taken");
                                                                     }
                                                                     crate::risk::recovery::RecoveryAction::ManualIntervention { reason } => {
-                                                                        warn!("需要手动干预: {}", reason);
+                                                                        warn!("Manual intervention required: {}", reason);
                                                                     }
                                                                 }
                                                             }
                                                             Err(e) => {
-                                                                error!("风险处理失败: {}", e);
+                                                                error!("Risk processing failed: {}", e);
                                                             }
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        // 错误详情已在executor中记录，这里只记录简要信息
+                                                        // Error details already logged in executor, only log summary here
                                                         let error_msg = e.to_string();
-                                                        // 提取简化的错误信息
-                                                        if error_msg.contains("套利失败") {
-                                                            // 错误信息已经格式化好了，直接使用
+                                                        // Extract simplified error message
+                                                        if error_msg.contains("arbitrage failed") {
+                                                            // Error message already formatted, use directly
                                                             error!("{}", error_msg);
                                                         } else {
-                                                            error!("执行套利交易失败: {}", error_msg);
+                                                            error!("Arbitrage execution failed: {}", error_msg);
                                                         }
                                                     }
                                                 }
@@ -903,44 +914,44 @@ async fn main() -> Result<()> {
                             }
                         }
                         Some(Err(e)) => {
-                            error!(error = %e, "订单簿更新错误");
-                            // 流错误，重新创建流
+                            error!(error = %e, "Orderbook update error");
+                            // Stream error, recreate stream
                             break;
                         }
                         None => {
-                            warn!("订单簿流结束，重新创建");
+                            warn!("Orderbook stream ended, recreating");
                             break;
                         }
                     }
                 }
 
-                // 定时仓位平衡任务
+                // Scheduled position balance task
                 _ = async {
                     if let Some(ref mut timer) = balance_timer {
                         timer.tick().await;
                         if let Err(e) = position_balancer.check_and_balance_positions(&market_token_map).await {
-                            warn!(error = %e, "仓位平衡检查失败");
+                            warn!(error = %e, "Position balance check failed");
                         }
                     } else {
                         futures::future::pending::<()>().await;
                     }
                 } => {
-                    // 仓位平衡任务已执行
+                    // Position balance task executed
                 }
 
-                // 定期检查：1) 是否进入新的5分钟窗口 2) 收尾触发（5分钟窗口需更频繁检查）
+                // Periodic check: 1) whether a new 5-minute window has started 2) wind-down trigger (5-min windows need more frequent checks)
                 _ = sleep(Duration::from_secs(1)) => {
                     let now = Utc::now();
                     let new_window_timestamp = MarketDiscoverer::calculate_current_window_timestamp(now);
 
-                    // 如果当前窗口时间戳与记录的不同，说明已经进入新窗口
+                    // If current window timestamp differs from recorded, a new window has started
                     if new_window_timestamp != current_window_timestamp {
                         info!(
                             old_window = current_window_timestamp,
                             new_window = new_window_timestamp,
-                            "检测到新的5分钟窗口，准备取消旧订阅并切换到新窗口"
+                            "New 5-minute window detected, cancelling old subscriptions and switching to new window"
                         );
-                        // 先drop stream以释放对monitor的借用，然后清理旧的订阅
+                        // Drop stream first to release borrow on monitor, then clean up old subscriptions
                         drop(stream);
                         monitor.clear();
                         break;
@@ -949,8 +960,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        // monitor 会在循环结束时自动 drop，无需手动清理
-        info!("当前窗口监控结束，刷新市场进入下一轮");
+        // monitor is automatically dropped at loop end, no manual cleanup needed
+        info!("Current window monitoring ended, refreshing markets for next round");
     }
 }
 

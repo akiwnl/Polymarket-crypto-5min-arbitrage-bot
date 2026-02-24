@@ -1,2 +1,2 @@
-// 简化错误处理，直接使用 anyhow::Error
-// 如果需要更细粒度的错误类型，可以后续扩展
+// Simplified error handling using anyhow::Error directly
+// Can be extended with more granular error types if needed

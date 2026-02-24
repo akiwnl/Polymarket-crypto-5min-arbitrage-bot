@@ -1,9 +1,9 @@
-//! CTF Merge 模块：将等量 YES/NO 代币合并回 USDC。
+//! CTF Merge module: merge equal amounts of YES/NO tokens back to USDC.
 //!
-//! 支持 **Gnosis Safe**（execTransaction）与 **Magic/Email EIP-1167**（Polymarket Relayer）。
-//! 合并数量自动取 `min(YES余额, NO余额)`，无需传入。
+//! Supports **Gnosis Safe** (execTransaction) and **Magic/Email EIP-1167** (Polymarket Relayer).
+//! Merge amount is automatically `min(YES balance, NO balance)`, no input needed.
 //!
-//! ## 调用示例
+//! ## Usage Example
 //!
 //! ```ignore
 //! use alloy::primitives::B256;
@@ -94,7 +94,7 @@ const PROXY_INIT_CODE_HASH: [u8; 32] = [
 ];
 const PROXY_DEFAULT_GAS: u64 = 160_000;
 
-/// 将 0x 开头的长 hex 缩短为 `0x` + 前 8 位 + `..` + 后 6 位，便于日志。
+/// Shorten a long 0x-prefixed hex to `0x` + first 8 chars + `..` + last 6 chars for logging.
 pub fn short_hex(s: &str) -> String {
     let hex = s.strip_prefix("0x").unwrap_or(s);
     if hex.len() > 14 {
@@ -166,10 +166,10 @@ async fn get_relay_payload(client: &reqwest::Client, base: &str, eoa: Address) -
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
-        anyhow::bail!("GET /relay-payload 失败 status={} body={}", status, text);
+        anyhow::bail!("GET /relay-payload failed status={} body={}", status, text);
     }
     let j: serde_json::Value = serde_json::from_str(&text)?;
-    let addr = j.get("address").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("relay-payload 缺少 address"))?;
+    let addr = j.get("address").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("relay-payload missing address"))?;
     let nonce = j
         .get("nonce")
         .map(|v| {
@@ -179,7 +179,7 @@ async fn get_relay_payload(client: &reqwest::Client, base: &str, eoa: Address) -
                 .unwrap_or_else(|| "0".into())
         })
         .unwrap_or_else(|| "0".into());
-    let relay = addr.trim().parse::<Address>().map_err(|e| anyhow::anyhow!("relay address 解析失败: {}", e))?;
+    let relay = addr.trim().parse::<Address>().map_err(|e| anyhow::anyhow!("relay address parse failed: {}", e))?;
     Ok((relay, nonce.to_string()))
 }
 
@@ -247,12 +247,12 @@ async fn relayer_execute_merge(
         .unwrap_or(PROXY_DEFAULT_GAS);
 
     if env::var("MERGE_PROXY_TO").map(|s| s.trim().eq_ignore_ascii_case("PROXY_WALLET")).unwrap_or(false) {
-        info!("ℹ️ MERGE_PROXY_TO=PROXY_WALLET 已忽略，使用 to=PROXY_FACTORY");
+        info!("ℹ️ MERGE_PROXY_TO=PROXY_WALLET ignored, using to=PROXY_FACTORY");
     }
     let to = PROXY_FACTORY;
     let struct_hash = create_struct_hash(eoa, to, &proxy_data, 0, 0, gas_limit, &nonce, RELAY_HUB, relay);
     let to_sign = eip191_hash(struct_hash);
-    let sig = signer.sign_hash(&to_sign).await.map_err(|e| anyhow::anyhow!("EOA 签名失败: {}", e))?;
+    let sig = signer.sign_hash(&to_sign).await.map_err(|e| anyhow::anyhow!("EOA signing failed: {}", e))?;
     let mut sig_bytes = sig.as_bytes().to_vec();
     if sig_bytes.len() == 65 && (sig_bytes[64] == 0 || sig_bytes[64] == 1) {
         sig_bytes[64] += 27;
@@ -282,14 +282,14 @@ async fn relayer_execute_merge(
     let path = RELAYER_SUBMIT;
     let method = "POST";
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
-    // 支持标准 Base64 (+/) 与 Base64URL (-_) 两种格式
+    // Support both standard Base64 (+/) and Base64URL (-_) formats
     let secret_b64 = builder_secret
         .trim()
         .replace('-', "+")
         .replace('_', "/");
     let secret_bytes = base64::engine::general_purpose::STANDARD
         .decode(&secret_b64)
-        .map_err(|e| anyhow::anyhow!("POLY_BUILDER_SECRET base64 解码失败: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("POLY_BUILDER_SECRET base64 decode failed: {}", e))?;
     let sig_hmac = build_hmac_signature(&secret_bytes, timestamp, method, path, &body_str);
 
     let url = format!("{}{}", base, path);
@@ -306,7 +306,7 @@ async fn relayer_execute_merge(
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
-        anyhow::bail!("Relayer 请求失败 status={} body={}", status, text);
+        anyhow::bail!("Relayer request failed status={} body={}", status, text);
     }
     let json: serde_json::Value = serde_json::from_str(&text)?;
     let hash = json
@@ -317,18 +317,18 @@ async fn relayer_execute_merge(
     Ok(hash.unwrap_or_else(|| text))
 }
 
-/// 对指定 `condition_id` 在 `proxy` 上合并最大可用 YES+NO 为 USDC。
+/// Merge max available YES+NO to USDC for the given `condition_id` on `proxy`.
 ///
-/// 合并数量为 `min(YES余额, NO余额)`。支持 Gnosis Safe（execTransaction）与 Magic/Email（Relayer）。
+/// Merge amount is `min(YES balance, NO balance)`. Supports Gnosis Safe (execTransaction) and Magic/Email (Relayer).
 ///
-/// - `condition_id`: 市场的 condition ID（32 字节十六进制）
-/// - `proxy`: Proxy 地址（Gnosis Safe 或 EIP-1167）
-/// - `private_key`: EOA 私钥
-/// - `rpc_url`: Polygon RPC，`None` 时用 `https://polygon-rpc.com`
+/// - `condition_id`: Market condition ID (32-byte hex)
+/// - `proxy`: Proxy address (Gnosis Safe or EIP-1167)
+/// - `private_key`: EOA private key
+/// - `rpc_url`: Polygon RPC, `None` uses `https://polygon-rpc.com`
 ///
-/// Magic/Email 路径会从环境变量读取：`POLY_BUILDER_API_KEY`、`POLY_BUILDER_SECRET`、`POLY_BUILDER_PASSPHRASE`、`RELAYER_URL`（可选）。
+/// Magic/Email path reads from env vars: `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, `POLY_BUILDER_PASSPHRASE`, `RELAYER_URL` (optional).
 ///
-/// 返回交易哈希（十六进制字符串）。
+/// Returns the transaction hash (hex string).
 pub async fn merge_max(
     condition_id: B256,
     proxy: Address,
@@ -342,7 +342,7 @@ pub async fn merge_max(
 
     let provider = ProviderBuilder::new().wallet(signer.clone()).connect(rpc).await?;
     let client = Client::new(provider.clone(), chain)?;
-    let config = contract_config(chain, false).ok_or_else(|| anyhow::anyhow!("不支持的 chain_id: {}", chain))?;
+    let config = contract_config(chain, false).ok_or_else(|| anyhow::anyhow!("unsupported chain_id: {}", chain))?;
     let prov_read = ProviderBuilder::new().connect(rpc).await?;
     let erc1155 = IERC1155Balance::new(config.conditional_tokens, prov_read);
     let ctf = config.conditional_tokens;
@@ -362,9 +362,9 @@ pub async fn merge_max(
 
     let merge_amount = b_yes.min(b_no);
     if merge_amount == U256::ZERO {
-        anyhow::bail!("无可用份额可 merge：YES={} NO={}，至少一方为 0。", b_yes, b_no);
+        anyhow::bail!("no shares available for merge: YES={} NO={}, at least one side is 0.", b_yes, b_no);
     }
-    info!("🔄 合并数量: {} ({} USDC)", merge_amount, merge_amount / U256::from(1_000_000));
+    info!("🔄 Merge amount: {} ({} USDC)", merge_amount, merge_amount / U256::from(1_000_000));
 
     let merge_req = MergePositionsRequest::for_binary_market(USDC_POLYGON, condition_id, merge_amount);
     let merge_calldata = encode_merge_calldata(&merge_req);
@@ -376,12 +376,12 @@ pub async fn merge_max(
         if derived != proxy {
             if !try_anyway {
                 anyhow::bail!(
-                    "POLYMARKET_PROXY_ADDRESS ({:?}) 与 ProxyFactory 的 CREATE2 推导 ({:?}) 不一致。\
-                     请改用 Polymarket 网页 merge，或设 MERGE_TRY_ANYWAY=1 强行尝试。",
+                    "POLYMARKET_PROXY_ADDRESS ({:?}) does not match ProxyFactory CREATE2 derivation ({:?}).\
+                     Use Polymarket web merge instead, or set MERGE_TRY_ANYWAY=1 to force attempt.",
                     proxy, derived
                 );
             }
-            warn!("MERGE_TRY_ANYWAY=1：derive != proxy，仍发 Relayer 请求。");
+            warn!("MERGE_TRY_ANYWAY=1: derive != proxy, still sending Relayer request.");
         }
         let builder_key = env::var("POLY_BUILDER_API_KEY").ok();
         let builder_secret = env::var("POLY_BUILDER_SECRET").ok();
@@ -390,11 +390,11 @@ pub async fn merge_max(
         match (builder_key.as_deref(), builder_secret.as_deref(), builder_passphrase.as_deref()) {
             (Some(k), Some(s), Some(p)) => {
                 let out = relayer_execute_merge(&merge_calldata, ctf, proxy, &signer, k, s, p, &relayer_url).await?;
-                info!("✅ Relayer 已提交 tx: {}", out);
+                info!("✅ Relayer submitted tx: {}", out);
                 return Ok(out);
             }
             _ => anyhow::bail!(
-                "Magic/Email 需配置 POLY_BUILDER_API_KEY、POLY_BUILDER_SECRET、POLY_BUILDER_PASSPHRASE；或改用网页 merge。",
+                "Magic/Email requires POLY_BUILDER_API_KEY, POLY_BUILDER_SECRET, POLY_BUILDER_PASSPHRASE; or use web merge instead.",
             ),
         }
     }
@@ -403,17 +403,17 @@ pub async fn merge_max(
     let nonce: U256 = safe.nonce().call().await.map_err(|e| {
         let msg = e.to_string();
         let hint = if msg.contains("revert") || msg.contains("reverted") {
-            " 该地址可能不是 Gnosis Safe；Magic/Email 请用 Relayer 或网页 merge。"
+            " This address may not be a Gnosis Safe; for Magic/Email use Relayer or web merge."
         } else { "" };
-        anyhow::anyhow!("读取 Safe nonce 失败: {}{}", msg, hint)
+        anyhow::anyhow!("failed to read Safe nonce: {}{}", msg, hint)
     })?;
 
     let tx_hash_data = safe
         .encodeTransactionData(ctf, U256::ZERO, merge_calldata.clone().into(), 0u8, U256::ZERO, U256::ZERO, U256::ZERO, Address::ZERO, Address::ZERO, nonce)
-        .call().await.map_err(|e| anyhow::anyhow!("Safe.encodeTransactionData 失败: {}", e))?.0;
+        .call().await.map_err(|e| anyhow::anyhow!("Safe.encodeTransactionData failed: {}", e))?.0;
 
     let tx_hash = keccak256(tx_hash_data.as_ref());
-    let sig = signer.sign_hash(&tx_hash).await.map_err(|e| anyhow::anyhow!("签名失败: {}", e))?;
+    let sig = signer.sign_hash(&tx_hash).await.map_err(|e| anyhow::anyhow!("signing failed: {}", e))?;
     let mut sig_bytes = sig.as_bytes().to_vec();
     if sig_bytes.len() == 65 && (sig_bytes[64] == 0 || sig_bytes[64] == 1) {
         sig_bytes[64] += 27;
@@ -421,10 +421,10 @@ pub async fn merge_max(
 
     let pending = safe
         .execTransaction(ctf, U256::ZERO, merge_calldata.into(), 0u8, U256::ZERO, U256::ZERO, U256::ZERO, Address::ZERO, Address::ZERO, sig_bytes.into())
-        .send().await.map_err(|e| anyhow::anyhow!("Safe.execTransaction 失败: {}", e))?;
+        .send().await.map_err(|e| anyhow::anyhow!("Safe.execTransaction failed: {}", e))?;
 
     let tx_hash_out = *pending.tx_hash();
-    let _receipt = pending.get_receipt().await.map_err(|e| anyhow::anyhow!("等待 receipt 失败: {}", e))?;
-    info!("✅ Merge 成功（Safe）tx: {:#x}", tx_hash_out);
+    let _receipt = pending.get_receipt().await.map_err(|e| anyhow::anyhow!("waiting for receipt failed: {}", e))?;
+    info!("✅ Merge succeeded (Safe) tx: {:#x}", tx_hash_out);
     Ok(format!("{:#x}", tx_hash_out))
 }

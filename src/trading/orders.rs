@@ -1,2 +1,2 @@
-// 订单相关的辅助类型和函数
-// 目前为空，可以后续扩展
+// Order-related helper types and functions
+// Currently empty, can be extended later

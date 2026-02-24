@@ -12,21 +12,21 @@ pub enum RecoveryAction {
     SellExcess { token_id: String, amount: Decimal },
     MonitorForExit {
         token_id: U256,
-        opposite_token_id: U256, // 对立边的token_id（用于计算差值）
+        opposite_token_id: U256, // Opposite side token_id (for calculating difference)
         amount: Decimal,
-        entry_price: Decimal, // 买入价格（卖一价）
-        take_profit_pct: Decimal, // 止盈百分比（例如0.05表示5%）
-        stop_loss_pct: Decimal, // 止损百分比（例如0.05表示5%）
+        entry_price: Decimal, // Buy price (best ask)
+        take_profit_pct: Decimal, // Take-profit percentage (e.g. 0.05 = 5%)
+        stop_loss_pct: Decimal, // Stop-loss percentage (e.g. 0.05 = 5%)
         pair_id: String,
-        market_display: String, // 市场显示名称（例如"btc预测市场"）
+        market_display: String, // Market display name
     },
     ManualIntervention { reason: String },
 }
 
 pub struct RecoveryStrategy {
     imbalance_threshold: Decimal,
-    take_profit_pct: Decimal, // 止盈百分比
-    stop_loss_pct: Decimal,   // 止损百分比
+    take_profit_pct: Decimal, // Take-profit percentage
+    stop_loss_pct: Decimal,   // Stop-loss percentage
 }
 
 impl RecoveryStrategy {
@@ -35,37 +35,37 @@ impl RecoveryStrategy {
             imbalance_threshold: Decimal::try_from(imbalance_threshold)
                 .unwrap_or(dec!(0.1)),
             take_profit_pct: Decimal::try_from(take_profit_pct)
-                .unwrap_or(dec!(0.05)), // 默认5%止盈
+                .unwrap_or(dec!(0.05)), // Default 5% take-profit
             stop_loss_pct: Decimal::try_from(stop_loss_pct)
-                .unwrap_or(dec!(0.05)), // 默认5%止损
+                .unwrap_or(dec!(0.05)), // Default 5% stop-loss
         }
     }
 
-    /// 处理部分成交（GTC订单的情况）
-    /// 对冲策略已暂时关闭，部分成交不平衡不做任何处理
+    /// Handle partial fill (GTC order scenario)
+    /// Hedging strategy temporarily disabled, no action for partial fill imbalance
     pub async fn handle_partial_fill(
         &self,
         pair: &OrderPair,
         _position_tracker: &PositionTracker,
     ) -> Result<RecoveryAction> {
-        // 计算不平衡数量
+        // Calculate imbalance amount
         let imbalance = (pair.yes_filled - pair.no_filled).abs();
         let total_filled = pair.yes_filled + pair.no_filled;
 
-        // 计算不平衡比例
+        // Calculate imbalance ratio
         let imbalance_ratio = if total_filled > dec!(0) {
             imbalance / total_filled
         } else {
             dec!(0)
         };
 
-        // 对冲策略已关闭，部分成交不平衡不做任何处理
+        // Hedging strategy disabled, no action for partial fill imbalance
         if imbalance_ratio > self.imbalance_threshold {
             let (side, amount) = if pair.yes_filled > pair.no_filled {
-                // YES成交多
+                // YES filled more
                 ("YES", pair.yes_filled - pair.no_filled)
             } else {
-                // NO成交多
+                // NO filled more
                 ("NO", pair.no_filled - pair.yes_filled)
             };
 
@@ -74,20 +74,20 @@ impl RecoveryStrategy {
                 side = side,
                 imbalance_amount = %amount,
                 imbalance_ratio = %imbalance_ratio,
-                "部分成交不平衡，对冲已关，不处理"
+                "partial fill imbalance, hedging disabled, no action"
             );
         }
 
-        // 返回None，不做任何对冲处理
+        // Return None, no hedging action
         Ok(RecoveryAction::None)
-        
-        // 旧代码：如果不平衡超过阈值，需要对冲
+
+        // Legacy code: if imbalance exceeds threshold, hedging needed
         // if imbalance_ratio > self.imbalance_threshold {
         //     let (token_to_sell, amount) = if pair.yes_filled > pair.no_filled {
-        //         // YES成交多，卖出多余的YES
+        //         // YES filled more, sell excess YES
         //         (pair.yes_token_id, pair.yes_filled - pair.no_filled)
         //     } else {
-        //         // NO成交多，卖出多余的NO
+        //         // NO filled more, sell excess NO
         //         (pair.no_token_id, pair.no_filled - pair.yes_filled)
         //     };
         // 
@@ -96,7 +96,7 @@ impl RecoveryStrategy {
         //         token_id = %token_to_sell,
         //         amount = %amount,
         //         imbalance_ratio = %imbalance_ratio,
-        //         "部分成交不平衡，执行对冲"
+        //         "Partial fill imbalance, executing hedge"
         //     );
         // 
         //     return Ok(RecoveryAction::SellExcess {
@@ -105,40 +105,40 @@ impl RecoveryStrategy {
         //     });
         // }
         // 
-        // // 不平衡在可接受范围内
+        // // Imbalance within acceptable range
         // Ok(RecoveryAction::None)
     }
 
-    /// 处理只购买一边成功（GTC订单的情况）
-    /// 对冲策略已暂时关闭，单边成交不做任何处理
+    /// Handle one-sided fill (GTC order scenario)
+    /// Hedging strategy temporarily disabled, no action for one-sided fill
     pub async fn handle_one_sided_fill(
         &self,
         pair: &OrderPair,
         _position_tracker: &PositionTracker,
     ) -> Result<RecoveryAction> {
-        // 确定哪个订单成功，哪个失败
+        // Determine which order succeeded and which failed
         let (side, filled_amount) =
             if pair.yes_filled > dec!(0) && pair.no_filled == dec!(0) {
-                // YES成功，NO失败（可能还在挂单）
+                // YES succeeded, NO failed (may still be pending)
                 ("YES", pair.yes_filled)
             } else if pair.no_filled > dec!(0) && pair.yes_filled == dec!(0) {
-                // NO成功，YES失败（可能还在挂单）
+                // NO succeeded, YES failed (may still be pending)
                 ("NO", pair.no_filled)
             } else {
                 return Ok(RecoveryAction::None);
             };
 
-        // 对冲策略已关闭，单边成交不做任何处理（详情由 executor 的 ⚠️ 单边成交 已记录）
+        // Hedging strategy disabled, no action for one-sided fill (details logged by executor's one-sided fill warning)
         debug!(
-            "单边成交 | {} 成交 {} 份 | 对冲已关，不处理",
+            "one-sided fill | {} filled {} shares | hedging disabled, no action",
             side, filled_amount
         );
 
-        // 返回None，不做任何对冲处理
+        // Return None, no hedging action
         Ok(RecoveryAction::None)
-        
-        // 旧代码：对冲策略：监测买一价，达到止盈止损时卖出
-        // // 确定对立边的token_id
+
+        // Legacy code: hedging strategy: monitor bid price, sell when take-profit/stop-loss reached
+        // // Determine opposite side token_id
         // let success_token = if pair.yes_filled > dec!(0) {
         //     pair.yes_token_id
         // } else {
@@ -154,11 +154,11 @@ impl RecoveryStrategy {
         //     token_id: success_token,
         //     opposite_token_id: opposite_token,
         //     amount: filled_amount,
-        //     entry_price: dec!(0), // 占位符，需要在主程序中从订单簿获取
+        //     entry_price: dec!(0), // placeholder, needs to be fetched from orderbook in main program
         //     take_profit_pct: self.take_profit_pct,
         //     stop_loss_pct: self.stop_loss_pct,
         //     pair_id: pair.pair_id.clone(),
-        //     market_display: "未知市场".to_string(), // 占位符，需要在主程序中从市场信息获取
+        //     market_display: "unknown market".to_string(), // placeholder, needs to be fetched from market info in main program
         // })
     }
 }

@@ -18,8 +18,8 @@ pub struct ArbitrageOpportunity {
 
 pub struct ArbitrageDetector {
     min_profit_threshold: Decimal,
-    max_depth: usize, // 最大探测深度
-    min_order_value_usd: Decimal, // 最小订单金额（USD）
+    max_depth: usize, // Max probe depth
+    min_order_value_usd: Decimal, // Minimum order value (USD)
 }
 
 impl ArbitrageDetector {
@@ -27,19 +27,19 @@ impl ArbitrageDetector {
         Self {
             min_profit_threshold: Decimal::try_from(min_profit_threshold)
                 .unwrap_or(dec!(0.001)),
-            max_depth: 10, // 默认最多探测10档
-            min_order_value_usd: dec!(1.0), // 最小订单金额$1
+            max_depth: 10, // Default max 10 levels
+            min_order_value_usd: dec!(1.0), // Min order value $1
         }
     }
 
-    /// 选中价格：仅用卖一价。返回 (yes_ask, no_ask, size, profit_pct, total_price)。
-    /// 后续在 executor 中：比较哪个价格高 → 加滑点 → 放入订单创建。
+    /// Select price: use best ask only. Returns (yes_ask, no_ask, size, profit_pct, total_price).
+    /// In executor: compare which price is higher -> add slippage -> create orders.
     fn find_best_opportunity(
         &self,
         yes_book: &BookUpdate,
         no_book: &BookUpdate,
     ) -> Option<(Decimal, Decimal, Decimal, Decimal, Decimal)> {
-        // asks 最后一个为卖一价（最低卖价）
+        // Last ask is the best ask (lowest sell price)
         let yes_best = yes_book.asks.last()?;
         let no_best = no_book.asks.last()?;
 
@@ -48,10 +48,10 @@ impl ArbitrageDetector {
         let total_price = yes_price + no_price;
 
         if total_price > dec!(1.0) {
-            return None; // 卖一总价 > 1，无套利
+            return None; // Best ask total > 1, no arbitrage
         }
 
-        // 卖一档的可用份额取两者较小值，向下取整到 2 位小数
+        // Available shares at best ask: min of both sides, floored to 2 decimal places
         let raw_size = yes_best.size.min(no_best.size);
         let final_size = if raw_size.is_zero() {
             dec!(0.01)
@@ -70,7 +70,7 @@ impl ArbitrageDetector {
     }
 
 
-    /// 打印订单深度（debug 级别，减少 info 刷屏）
+    /// Print orderbook depth (debug level, reduce info log spam)
     fn print_orderbook_depth(
         &self,
         yes_book: &BookUpdate,
@@ -103,19 +103,19 @@ impl ArbitrageDetector {
         debug!(
             yes_depth = yes_depth_str.join(", "),
             no_depth = no_depth_str.join(", "),
-            "订单深度"
+            "orderbook depth"
         );
-        // 选档日志已移至 executor 中，在执行套利时打印加滑点后的价格
+        // Level selection log moved to executor, prints price with slippage when executing arbitrage
     }
 
-    /// 检查订单簿是否存在套利机会
+    /// Check orderbook for arbitrage opportunities
     pub fn check_arbitrage(
         &self,
         yes_book: &BookUpdate,
         no_book: &BookUpdate,
         market_id: &B256,
     ) -> Option<ArbitrageOpportunity> {
-        // 先选卖一价；executor 中再：比较谁高 → 加滑点 → 放入订单创建
+        // Select best ask first; in executor: compare which is higher -> add slippage -> create orders
         let (yes_ask, no_ask, final_size, net_profit_pct, total_price) =
             self.find_best_opportunity(yes_book, no_book)?;
 
@@ -128,7 +128,7 @@ impl ArbitrageDetector {
             total_price = %total_price,
             net_profit_pct = %net_profit_pct,
             order_size = %final_size,
-            "发现套利机会（卖一价）"
+            "arbitrage opportunity found (best ask)"
         );
 
         Some(ArbitrageOpportunity {

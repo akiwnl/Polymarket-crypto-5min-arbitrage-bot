@@ -22,7 +22,7 @@ struct ArbitrageRecord {
     no_size: String,
 }
 
-/// 将套利机会信息写入文件
+/// Write arbitrage opportunity info to file
 pub fn log_arbitrage_opportunity(
     opp: &ArbitrageOpportunity,
     market_name: &str,
@@ -42,29 +42,29 @@ pub fn log_arbitrage_opportunity(
         no_size: opp.no_size.to_string(),
     };
 
-    // 将记录格式化为JSON
+    // Format record as JSON
     let json = serde_json::to_string_pretty(&record)?;
     
-    // 追加写入文件
+    // Append to file
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(file_path)?;
     
     writeln!(file, "{}", json)?;
-    writeln!(file, "---")?; // 分隔符
-    file.flush()?; // 确保立即写入磁盘
+    writeln!(file, "---")?; // separator
+    file.flush()?; // ensure immediate disk write
     
     Ok(())
 }
 
-/// 异步版本的套利机会记录（用于避免阻塞）
+/// Async version of arbitrage opportunity logging (to avoid blocking)
 pub async fn log_arbitrage_opportunity_async(
     opp: &ArbitrageOpportunity,
     market_name: &str,
     file_path: &str,
 ) {
     if let Err(e) = log_arbitrage_opportunity(opp, market_name, file_path) {
-        error!(error = %e, "写入套利机会文件失败");
+        error!(error = %e, "Failed to write arbitrage opportunity file");
     }
 }

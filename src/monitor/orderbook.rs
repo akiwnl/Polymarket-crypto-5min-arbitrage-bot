@@ -10,14 +10,14 @@ use tracing::{debug, info};
 
 use crate::market::MarketInfo;
 
-/// 缩短 B256 用于日志：保留 0x + 前 8 位 hex，如 0xb91126b7..
+/// Shorten B256 for logging: keep 0x + first 8 hex chars, e.g. 0xb91126b7..
 #[inline]
 fn short_b256(b: &B256) -> String {
     let s = format!("{b}");
     if s.len() > 12 { format!("{}..", &s[..10]) } else { s }
 }
 
-/// 缩短 U256 用于日志：保留末尾 8 位，如 ..67033653
+/// Shorten U256 for logging: keep last 8 digits, e.g. ..67033653
 #[inline]
 fn short_u256(u: &U256) -> String {
     let s = format!("{u}");
@@ -43,17 +43,17 @@ pub struct OrderBookPair {
 impl OrderBookMonitor {
     pub fn new() -> Self {
         Self {
-            // 使用未认证的客户端：订单簿订阅不需要认证，这是公开数据
-            // 只有订阅用户数据（如用户订单、交易等）才需要认证
+            // Use unauthenticated client: orderbook subscription doesn't require auth, it's public data
+            // Only user data subscriptions (e.g. user orders, trades) require authentication
             ws_client: WsClient::default(),
             books: DashMap::new(),
             market_map: HashMap::new(),
         }
     }
 
-    /// 订阅新市场
+    /// Subscribe to a new market
     pub fn subscribe_market(&mut self, market: &MarketInfo) -> Result<()> {
-        // 记录市场映射
+        // Record market mapping
         self.market_map.insert(
             market.market_id,
             (market.yes_token_id, market.no_token_id),
@@ -63,20 +63,20 @@ impl OrderBookMonitor {
             market_id = short_b256(&market.market_id),
             yes = short_u256(&market.yes_token_id),
             no = short_u256(&market.no_token_id),
-            "订阅市场订单簿"
+            "subscribed to market orderbook"
         );
 
         Ok(())
     }
 
-    /// 创建订单簿订阅流
-    /// 
-    /// 注意：订单簿订阅使用未认证的 WebSocket 客户端，因为订单簿数据是公开的。
-    /// 只有订阅用户相关数据（如用户订单状态、交易历史等）才需要认证。
+    /// Create orderbook subscription stream
+    ///
+    /// Note: Orderbook subscription uses an unauthenticated WebSocket client since orderbook data is public.
+    /// Only user-related data subscriptions (e.g. order status, trade history) require authentication.
     pub fn create_orderbook_stream(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<BookUpdate>> + Send + '_>>> {
-        // 收集所有需要订阅的token_id
+        // Collect all token_ids to subscribe
         let token_ids: Vec<U256> = self
             .market_map
             .values()
@@ -84,22 +84,22 @@ impl OrderBookMonitor {
             .collect();
 
         if token_ids.is_empty() {
-            return Err(anyhow::anyhow!("没有市场需要订阅"));
+            return Err(anyhow::anyhow!("no markets to subscribe"));
         }
 
-        info!(token_count = token_ids.len(), "创建订单簿订阅流（未认证）");
+        info!(token_count = token_ids.len(), "creating orderbook subscription stream (unauthenticated)");
 
-        // subscribe_orderbook 不需要认证，使用未认证客户端即可
+        // subscribe_orderbook doesn't require auth, unauthenticated client is sufficient
         let stream = self.ws_client.subscribe_orderbook(token_ids)?;
-        // 将 SDK 的 Error 转换为 anyhow::Error
+        // Convert SDK Error to anyhow::Error
         let stream = stream.map(|result| result.map_err(|e| anyhow::anyhow!("{}", e)));
         Ok(Box::pin(stream))
     }
 
-    /// 处理订单簿更新
+    /// Handle orderbook update
     pub fn handle_book_update(&self, book: BookUpdate) -> Option<OrderBookPair> {
 
-        // 打印前5档买卖价格（用于调试）
+        // Print top 5 bid/ask levels (for debugging)
         if !book.bids.is_empty() {
             let top_bids: Vec<String> = book.bids.iter()
                 .take(5)
@@ -107,7 +107,7 @@ impl OrderBookMonitor {
                 .collect();
             debug!(
                 asset_id = %book.asset_id,
-                "买盘前5档: {}",
+                "top 5 bids: {}",
                 top_bids.join(", ")
             );
         }
@@ -118,15 +118,15 @@ impl OrderBookMonitor {
                 .collect();
             debug!(
                 asset_id = short_u256(&book.asset_id),
-                "卖盘前5档: {}",
+                "top 5 asks: {}",
                 top_asks.join(", ")
             );
         }
 
-        // 更新订单簿缓存
+        // Update orderbook cache
         self.books.insert(book.asset_id, book.clone());
 
-        // 查找这个 token 属于哪个市场；任一侧（YES 或 NO）更新都返回 OrderBookPair，以便及时反应套利
+        // Find which market this token belongs to; either side (YES or NO) update returns OrderBookPair for timely arbitrage response
         for (market_id, (yes_token, no_token)) in &self.market_map {
             if book.asset_id == *yes_token {
                 if let Some(no_book) = self.books.get(no_token) {
@@ -150,12 +150,12 @@ impl OrderBookMonitor {
         None
     }
 
-    /// 获取订单簿（如果存在）
+    /// Get orderbook (if exists)
     pub fn get_book(&self, token_id: U256) -> Option<BookUpdate> {
         self.books.get(&token_id).map(|b| b.clone())
     }
 
-    /// 清除所有订阅
+    /// Clear all subscriptions
     pub fn clear(&mut self) {
         self.books.clear();
         self.market_map.clear();

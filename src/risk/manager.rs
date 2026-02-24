@@ -63,9 +63,9 @@ impl RiskManager {
         }
     }
 
-    /// 注册新的订单对
-    /// yes_price: YES订单的买入价格
-    /// no_price: NO订单的买入价格
+    /// Register a new order pair
+    /// yes_price: YES order buy price
+    /// no_price: NO order buy price
     pub fn register_order_pair(
         &self,
         result: OrderPairResult,
@@ -102,34 +102,34 @@ impl RiskManager {
             created_at: Utc::now(),
         };
 
-        // 更新持仓（敞口已在「执行套利」时按订单成本增加，此处不再按成交更新敞口）
+        // Update positions (exposure already increased by order cost during arbitrage execution, not updated by fill here)
         self.position_tracker.update_position(yes_token, pair.yes_filled);
         self.position_tracker.update_position(no_token, pair.no_filled);
 
-        // 这个日志已经在executor中打印了，这里不再重复打印
+        // This log is already printed in executor, no need to repeat here
         debug!(
             pair_id = %pair.pair_id,
             status = ?status,
             yes_filled = %pair.yes_filled,
             no_filled = %pair.no_filled,
-            "注册订单对"
+            "registered order pair"
         );
 
-        // 使用 pair.pair_id 的克隆来插入，因为 DashMap 需要拥有所有权
+        // Clone pair.pair_id for insertion since DashMap requires ownership
         self.pending_pairs.insert(pair.pair_id.clone(), pair);
     }
 
-    /// 处理订单对并决定恢复策略
+    /// Handle order pair and decide recovery strategy
     pub async fn handle_order_pair(&self, pair_id: &str) -> Result<RecoveryAction> {
         let pair = self
             .pending_pairs
             .get(pair_id)
-            .ok_or_else(|| anyhow::anyhow!("订单对 {} 不存在", pair_id))?
+            .ok_or_else(|| anyhow::anyhow!("order pair {} not found", pair_id))?
             .clone();
 
         match pair.status {
             PairStatus::BothFilled => {
-                info!(pair_id = %pair.pair_id, "两个订单都完全成交，无需恢复");
+                info!(pair_id = %pair.pair_id, "both orders fully filled, no recovery needed");
                 Ok(RecoveryAction::None)
             }
             PairStatus::PartiallyFilled => {
@@ -144,17 +144,17 @@ impl RiskManager {
             }
             PairStatus::BothFailed => {
                 error!(
-                    "❌ 套利失败 | YES和NO订单都未成交，可能原因：价格已变化或流动性不足"
+                    "❌ Arbitrage failed | both YES and NO orders unfilled, possible cause: price changed or insufficient liquidity"
                 );
                 Ok(RecoveryAction::ManualIntervention {
-                    reason: "两个订单都失败".to_string(),
+                    reason: "both orders failed".to_string(),
                 })
             }
             _ => Ok(RecoveryAction::None),
         }
     }
 
-    /// 获取持仓跟踪器（Arc引用）
+    /// Get position tracker (Arc reference)
     pub fn position_tracker(&self) -> std::sync::Arc<PositionTracker> {
         self.position_tracker.clone()
     }

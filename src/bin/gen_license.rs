@@ -1,6 +1,6 @@
-//! 许可证生成工具（仅作者使用）：根据过期时间生成 license.key 内容。
+//! License generation tool (author use only): generate license.key content based on expiry time.
 //!
-//! 用法示例：
+//! Usage examples:
 //!   cargo run --bin gen_license -- --hours 24
 //!   cargo run --bin gen_license -- --until "2025-02-03 00:00:00"
 //!   cargo run --bin gen_license -- --hours 24 --out license.key
@@ -25,9 +25,9 @@ fn main() -> Result<()> {
                 i += 1;
                 hours = Some(
                     args.get(i)
-                        .context("--hours 需要参数")?
+                        .context("--hours requires an argument")?
                         .parse()
-                        .context("--hours 必须为正整数")?,
+                        .context("--hours must be a positive integer")?,
                 );
                 i += 1;
             }
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
                 i += 1;
                 until = Some(
                     args.get(i)
-                        .context("--until 需要参数（如 2025-02-03 00:00:00）")?
+                        .context("--until requires an argument (e.g. 2025-02-03 00:00:00)")?
                         .clone(),
                 );
                 i += 1;
@@ -44,16 +44,16 @@ fn main() -> Result<()> {
                 i += 1;
                 out_path = Some(
                     args.get(i)
-                        .context("--out 需要参数")?
+                        .context("--out requires an argument")?
                         .into(),
                 );
                 i += 1;
             }
             _ => {
-                eprintln!("用法: gen_license --hours <N> | --until \"<datetime>\" [--out license.key]");
-                eprintln!("  --hours N    从当前起 N 小时后过期");
-                eprintln!("  --until \"...\" 指定过期时间（UTC），格式如 2025-02-03 00:00:00");
-                eprintln!("  --out FILE   写入文件，不指定则输出到 stdout");
+                eprintln!("Usage: gen_license --hours <N> | --until \"<datetime>\" [--out license.key]");
+                eprintln!("  --hours N    Expires N hours from now");
+                eprintln!("  --until \"...\" Specify expiry time (UTC), format: 2025-02-03 00:00:00");
+                eprintln!("  --out FILE   Write to file, outputs to stdout if not specified");
                 std::process::exit(1);
             }
         }
@@ -72,17 +72,17 @@ fn main() -> Result<()> {
                 chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M:%S")
                     .map(|n| n.and_utc())
             })
-            .context("解析 --until 时间失败，请使用 2025-02-03 00:00:00 或 RFC3339 格式")?;
+            .context("Failed to parse --until time, use 2025-02-03 00:00:00 or RFC3339 format")?;
         dt_utc.timestamp() as u64
     } else {
-        anyhow::bail!("请指定 --hours <N> 或 --until \"<datetime>\"");
+        anyhow::bail!("Please specify --hours <N> or --until \"<datetime>\"");
     };
 
     let license = poly_5min_bot::trial::create_license(expiry_secs)?;
 
     if let Some(path) = out_path {
-        fs::write(&path, &license).context("写入许可证文件失败")?;
-        eprintln!("已写入: {}", path.display());
+        fs::write(&path, &license).context("Failed to write license file")?;
+        eprintln!("Written to: {}", path.display());
     } else {
         io::stdout().write_all(license.as_bytes())?;
         io::stdout().flush()?;
