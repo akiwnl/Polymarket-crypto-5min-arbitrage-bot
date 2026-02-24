@@ -66,20 +66,37 @@ pub struct Config {
     pub wind_down_before_window_end_minutes: u64,
     /// 收尾时单腿卖出的限价单价格（尽量快速成交），默认0.01
     pub wind_down_sell_price: f64,
+    /// Dry run 模式：不执行真实交易，仅记录日志
+    pub dry_run: bool,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
+        let dry_run = env::var("DRY_RUN")
+            .unwrap_or_else(|_| "false".to_string())
+            .trim()
+            .to_lowercase()
+            == "true";
+
         // 解析proxy_address（可选）
         let proxy_address: Option<Address> = env::var("POLYMARKET_PROXY_ADDRESS")
             .ok()
             .and_then(|addr| addr.parse().ok());
 
+        // Dry run 模式下私钥非必需：未设置时使用 dummy key
+        let private_key = match env::var("POLYMARKET_PRIVATE_KEY") {
+            Ok(key) => key,
+            Err(_) if dry_run => {
+                "0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string()
+            }
+            Err(_) => panic!("POLYMARKET_PRIVATE_KEY must be set"),
+        };
+
         Ok(Config {
-            private_key: env::var("POLYMARKET_PRIVATE_KEY")
-                .expect("POLYMARKET_PRIVATE_KEY must be set"),
+            private_key,
             proxy_address,
             min_profit_threshold: env::var("MIN_PROFIT_THRESHOLD")
                 .unwrap_or_else(|_| "0.001".to_string())
@@ -166,6 +183,7 @@ impl Config {
                 .unwrap_or_else(|_| "0.01".to_string())
                 .parse()
                 .unwrap_or(0.01), // 默认0.01
+            dry_run,
         })
     }
 }

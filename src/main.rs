@@ -198,15 +198,22 @@ async fn main() -> Result<()> {
     let _scheduler = MarketScheduler::new(_discoverer, config.market_refresh_advance_secs);
     let _detector = ArbitrageDetector::new(config.min_profit_threshold);
     
-    // 验证私钥格式
-    info!("正在验证私钥格式...");
     use alloy::signers::local::LocalSigner;
     use polymarket_client_sdk::POLYGON;
     use std::str::FromStr;
-    
-    let _signer_test = LocalSigner::from_str(&config.private_key)
-        .map_err(|e| anyhow::anyhow!("私钥格式无效: {}", e))?;
-    info!("私钥格式验证通过");
+
+    if config.dry_run {
+        info!("========================================");
+        info!("[DRY RUN] 模拟模式已启用");
+        info!("[DRY RUN] 不会执行真实交易、下单或区块链操作");
+        info!("========================================");
+    } else {
+        // 验证私钥格式
+        info!("正在验证私钥格式...");
+        let _signer_test = LocalSigner::from_str(&config.private_key)
+            .map_err(|e| anyhow::anyhow!("私钥格式无效: {}", e))?;
+        info!("私钥格式验证通过");
+    }
 
     // 初始化交易执行器（需要认证）
     info!("正在初始化交易执行器（需要API认证）...");
@@ -223,6 +230,7 @@ async fn main() -> Result<()> {
         config.slippage,
         config.gtd_expiration_secs,
         config.arbitrage_order_type.clone(),
+        config.dry_run,
     ).await {
         Ok(exec) => {
             info!("交易执行器认证成功（可能使用了派生API key）");
@@ -240,42 +248,47 @@ async fn main() -> Result<()> {
     };
 
     // 创建CLOB客户端用于风险管理（需要认证）
-    info!("正在初始化风险管理客户端（需要API认证）...");
     use alloy::signers::Signer;
     use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
     use polymarket_client_sdk::clob::types::SignatureType;
 
-    let signer_for_risk = LocalSigner::from_str(&config.private_key)?
-        .with_chain_id(Some(POLYGON));
-    let clob_config = ClobConfig::builder().use_server_time(true).build();
-    let mut auth_builder_risk = Client::new("https://clob.polymarket.com", clob_config)?
-        .authentication_builder(&signer_for_risk);
-    
-    // 如果提供了proxy_address，设置funder和signature_type
-    if let Some(funder) = config.proxy_address {
-        auth_builder_risk = auth_builder_risk
-            .funder(funder)
-            .signature_type(SignatureType::Proxy);
-    }
-    
-    let clob_client = match auth_builder_risk.authenticate().await {
-        Ok(client) => {
-            info!("风险管理客户端认证成功（可能使用了派生API key）");
-            client
+    let clob_client = if config.dry_run {
+        info!("[DRY RUN] 跳过风险管理客户端认证");
+        None
+    } else {
+        info!("正在初始化风险管理客户端（需要API认证）...");
+        let signer_for_risk = LocalSigner::from_str(&config.private_key)?
+            .with_chain_id(Some(POLYGON));
+        let clob_config = ClobConfig::builder().use_server_time(true).build();
+        let mut auth_builder_risk = Client::new("https://clob.polymarket.com", clob_config)?
+            .authentication_builder(&signer_for_risk);
+
+        // 如果提供了proxy_address，设置funder和signature_type
+        if let Some(funder) = config.proxy_address {
+            auth_builder_risk = auth_builder_risk
+                .funder(funder)
+                .signature_type(SignatureType::Proxy);
         }
-        Err(e) => {
-            error!(error = %e, "风险管理客户端认证失败！无法继续运行。");
-            error!("请检查：");
-            error!("  1. POLYMARKET_PRIVATE_KEY 环境变量是否正确设置");
-            error!("  2. 私钥格式是否正确");
-            error!("  3. 网络连接是否正常");
-            error!("  4. Polymarket API服务是否可用");
-            return Err(anyhow::anyhow!("认证失败，程序退出: {}", e));
+
+        match auth_builder_risk.authenticate().await {
+            Ok(client) => {
+                info!("风险管理客户端认证成功（可能使用了派生API key）");
+                Some(client)
+            }
+            Err(e) => {
+                error!(error = %e, "风险管理客户端认证失败！无法继续运行。");
+                error!("请检查：");
+                error!("  1. POLYMARKET_PRIVATE_KEY 环境变量是否正确设置");
+                error!("  2. 私钥格式是否正确");
+                error!("  3. 网络连接是否正常");
+                error!("  4. Polymarket API服务是否可用");
+                return Err(anyhow::anyhow!("认证失败，程序退出: {}", e));
+            }
         }
     };
-    
+
     let _risk_manager = Arc::new(RiskManager::new(clob_client.clone(), &config));
-    
+
     // 创建对冲监测器（传入PositionTracker的Arc引用以更新风险敞口）
     // 对冲策略已暂时关闭，但保留hedge_monitor变量以备将来使用
     let position_tracker = _risk_manager.position_tracker();
@@ -286,25 +299,27 @@ async fn main() -> Result<()> {
         position_tracker,
     );
 
-    // 验证认证是否真的成功 - 尝试一个简单的API调用
-    info!("正在验证认证状态（通过API调用测试）...");
-    match executor.verify_authentication().await {
-        Ok(_) => {
-            info!("✅ 认证验证成功，API调用正常");
-        }
-        Err(e) => {
-            error!(error = %e, "❌ 认证验证失败！虽然authenticate()没有报错，但API调用失败。");
-            error!("这表明认证实际上没有成功，可能是：");
-            error!("  1. API密钥创建失败（看到'Could not create api key'警告）");
-            error!("  2. 私钥对应的账户可能没有在Polymarket上注册");
-            error!("  3. 账户可能被限制或暂停");
-            error!("  4. 网络连接问题");
-            error!("程序将退出，请解决认证问题后再运行。");
-            return Err(anyhow::anyhow!("认证验证失败: {}", e));
+    if !config.dry_run {
+        // 验证认证是否真的成功 - 尝试一个简单的API调用
+        info!("正在验证认证状态（通过API调用测试）...");
+        match executor.verify_authentication().await {
+            Ok(_) => {
+                info!("✅ 认证验证成功，API调用正常");
+            }
+            Err(e) => {
+                error!(error = %e, "❌ 认证验证失败！虽然authenticate()没有报错，但API调用失败。");
+                error!("这表明认证实际上没有成功，可能是：");
+                error!("  1. API密钥创建失败（看到'Could not create api key'警告）");
+                error!("  2. 私钥对应的账户可能没有在Polymarket上注册");
+                error!("  3. 账户可能被限制或暂停");
+                error!("  4. 网络连接问题");
+                error!("程序将退出，请解决认证问题后再运行。");
+                return Err(anyhow::anyhow!("认证验证失败: {}", e));
+            }
         }
     }
 
-    info!("✅ 所有组件初始化完成，认证验证通过");
+    info!("✅ 所有组件初始化完成{}", if config.dry_run { " [DRY RUN]" } else { "，认证验证通过" });
 
     // RPC 健康检查组件（端点探测、熔断、指标）
     let rpc_cfg = rpc_check::CheckConfig::builder()
@@ -324,8 +339,9 @@ async fn main() -> Result<()> {
     ));
 
     // 定时持仓同步任务：每N秒从API获取最新持仓，覆盖本地缓存
+    // Dry run 模式下禁用，持仓通过模拟成交跟踪
     let position_sync_interval = config.position_sync_interval_secs;
-    if position_sync_interval > 0 {
+    if position_sync_interval > 0 && !config.dry_run {
         let position_tracker_sync = _risk_manager.position_tracker();
         tokio::spawn(async move {
             let interval = Duration::from_secs(position_sync_interval);
@@ -371,8 +387,9 @@ async fn main() -> Result<()> {
     let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> = Arc::new(tokio::sync::Mutex::new(None));
 
     // 定时 Merge：每 N 分钟根据持仓执行 merge，仅对 YES+NO 双边都持仓的市场
+    // Dry run 模式下禁用 merge（需要区块链交互）
     let merge_interval = config.merge_interval_minutes;
-    if merge_interval > 0 {
+    if merge_interval > 0 && !config.dry_run {
         if let Some(proxy) = config.proxy_address {
             let private_key = config.private_key.clone();
             let position_tracker = _risk_manager.position_tracker().clone();
@@ -485,10 +502,26 @@ async fn main() -> Result<()> {
                 let seconds_until_end = (window_end - now).num_seconds();
                 let threshold_seconds = config.wind_down_before_window_end_minutes as i64 * 60;
                 if seconds_until_end <= threshold_seconds {
-                    info!("🛑 触发收尾 | 距窗口结束 {} 秒", seconds_until_end);
+                    info!("🛑 触发收尾 | 距窗口结束 {} 秒{}", seconds_until_end, if config.dry_run { " [DRY RUN]" } else { "" });
                     wind_down_done = true;
                     wind_down_in_progress.store(true, Ordering::Relaxed);
 
+                    if config.dry_run {
+                        // Dry run: 仅记录日志，模拟扣减持仓
+                        let position_tracker = _risk_manager.position_tracker();
+                        info!("[DRY RUN] 收尾：模拟取消所有挂单");
+                        info!("[DRY RUN] 收尾：模拟 Merge 双边持仓");
+                        // 模拟 merge 扣减：遍历所有 token 持仓，将成对的持仓扣减
+                        let all_positions = position_tracker.get_all_positions();
+                        for (token_id, size) in &all_positions {
+                            if *size > dec!(0) {
+                                info!("[DRY RUN] 收尾：模拟卖出 | token_id={:#x} | 数量:{}", token_id, size);
+                            }
+                        }
+                        position_tracker.reset_exposure();
+                        info!("[DRY RUN] 收尾完成，已重置风险敞口");
+                        wind_down_in_progress.store(false, Ordering::Relaxed);
+                    } else {
                     // 收尾在独立任务中执行，不阻塞订单簿；各市场 merge 之间间隔 30 秒
                     let executor_wd = executor.clone();
                     let config_wd = config.clone();
@@ -575,6 +608,7 @@ async fn main() -> Result<()> {
                         info!("🛑 收尾完成，继续监控至窗口结束");
                         wind_down_flag.store(false, Ordering::Relaxed);
                     });
+                    } // end else !dry_run
                 }
             }
 

@@ -26,12 +26,13 @@ pub struct OrderPairResult {
 }
 
 pub struct TradingExecutor {
-    client: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
     private_key: String,
     max_order_size: Decimal,
     slippage: [Decimal; 2], // [first, second]，仅下降侧用 second，上涨与持平用 first
     gtd_expiration_secs: u64,
     arbitrage_order_type: OrderType,
+    dry_run: bool,
 }
 
 impl TradingExecutor {
@@ -42,7 +43,25 @@ impl TradingExecutor {
         slippage: [f64; 2],
         gtd_expiration_secs: u64,
         arbitrage_order_type: OrderType,
+        dry_run: bool,
     ) -> Result<Self> {
+        if dry_run {
+            info!("[DRY RUN] 交易执行器以模拟模式启动，不会执行真实交易");
+            return Ok(Self {
+                client: None,
+                private_key,
+                max_order_size: Decimal::try_from(max_order_size_usdc)
+                    .unwrap_or(rust_decimal_macros::dec!(100.0)),
+                slippage: [
+                    Decimal::try_from(slippage[0]).unwrap_or(dec!(0.0)),
+                    Decimal::try_from(slippage[1]).unwrap_or(dec!(0.01)),
+                ],
+                gtd_expiration_secs,
+                arbitrage_order_type,
+                dry_run,
+            });
+        }
+
         // 验证私钥格式
         let signer = LocalSigner::from_str(&private_key)
             .map_err(|e| anyhow::anyhow!("私钥格式无效: {}. 请确保私钥是64字符的十六进制字符串（不带0x前缀）", e))?
@@ -52,14 +71,14 @@ impl TradingExecutor {
         let mut auth_builder = Client::new("https://clob.polymarket.com", config)
             .map_err(|e| anyhow::anyhow!("创建CLOB客户端失败: {}", e))?
             .authentication_builder(&signer);
-        
+
         // 如果提供了proxy_address，设置funder和signature_type（按照Python SDK模式）
         if let Some(funder) = proxy_address {
             auth_builder = auth_builder
                 .funder(funder)
                 .signature_type(SignatureType::Proxy);
         }
-        
+
         let client = auth_builder
             .authenticate()
             .await
@@ -71,7 +90,7 @@ impl TradingExecutor {
             })?;
 
         Ok(Self {
-            client,
+            client: Some(client),
             private_key,
             max_order_size: Decimal::try_from(max_order_size_usdc)
                 .unwrap_or(rust_decimal_macros::dec!(100.0)),
@@ -81,23 +100,33 @@ impl TradingExecutor {
             ],
             gtd_expiration_secs,
             arbitrage_order_type,
+            dry_run,
         })
     }
 
     /// 验证认证是否真的成功 - 按照官方示例使用 api_keys() 来验证
     pub async fn verify_authentication(&self) -> Result<()> {
+        if self.dry_run {
+            info!("[DRY RUN] 跳过认证验证");
+            return Ok(());
+        }
         // 按照官方示例，使用 api_keys() 来验证认证状态
-        self.client.api_keys().await
+        self.client.as_ref().unwrap().api_keys().await
             .map_err(|e| anyhow::anyhow!("认证验证失败: API调用返回错误: {}", e))?;
         Ok(())
     }
 
     /// 取消该账户所有挂单（收尾时使用）
-    pub async fn cancel_all_orders(&self) -> Result<polymarket_client_sdk::clob::types::response::CancelOrdersResponse> {
-        self.client
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        if self.dry_run {
+            info!("[DRY RUN] 模拟取消所有挂单");
+            return Ok(());
+        }
+        self.client.as_ref().unwrap()
             .cancel_all_orders()
             .await
-            .map_err(|e| anyhow::anyhow!("取消所有挂单失败: {}", e))
+            .map_err(|e| anyhow::anyhow!("取消所有挂单失败: {}", e))?;
+        Ok(())
     }
 
     /// 以指定价格下 GTC 卖单（收尾时市价意图卖出单腿持仓）
@@ -106,11 +135,18 @@ impl TradingExecutor {
         token_id: U256,
         price: Decimal,
         size: Decimal,
-    ) -> Result<polymarket_client_sdk::clob::types::response::PostOrderResponse> {
+    ) -> Result<()> {
+        if self.dry_run {
+            info!(
+                "[DRY RUN] 模拟卖出 | token_id={:#x} | 价格:{:.4} | 数量:{}",
+                token_id, price, size
+            );
+            return Ok(());
+        }
+        let client = self.client.as_ref().unwrap();
         let signer = LocalSigner::from_str(&self.private_key)?
             .with_chain_id(Some(POLYGON));
-        let order = self
-            .client
+        let order = client
             .limit_order()
             .token_id(token_id)
             .side(Side::Sell)
@@ -119,11 +155,12 @@ impl TradingExecutor {
             .order_type(OrderType::GTC)
             .build()
             .await?;
-        let signed = self.client.sign(&signer, order).await?;
-        self.client
+        let signed = client.sign(&signer, order).await?;
+        client
             .post_order(signed)
             .await
-            .map_err(|e| anyhow::anyhow!("卖出订单提交失败: {}", e))
+            .map_err(|e| anyhow::anyhow!("卖出订单提交失败: {}", e))?;
+        Ok(())
     }
 
     /// 按方向取滑点：仅下降(↓)用 second，上涨(↑)和持平(−/空)用 first
@@ -212,13 +249,37 @@ impl TradingExecutor {
             ));
         }
 
+        // Dry run: 模拟完整成交，不实际下单
+        if self.dry_run {
+            info!(
+                "[DRY RUN] 模拟套利交易 | 市场:{} | YES价格:{:.4} (含滑点:{:.4}) | NO价格:{:.4} (含滑点:{:.4}) | 数量:{} | 订单类型:{}",
+                opp.market_id,
+                opp.yes_ask_price, yes_price_with_slippage,
+                opp.no_ask_price, no_price_with_slippage,
+                order_size,
+                self.arbitrage_order_type
+            );
+            return Ok(OrderPairResult {
+                pair_id,
+                yes_order_id: format!("dry-run-yes-{}", &pair_id[..8]),
+                no_order_id: format!("dry-run-no-{}", &pair_id[..8]),
+                yes_filled: order_size,
+                no_filled: order_size,
+                yes_size: order_size,
+                no_size: order_size,
+                success: true,
+            });
+        }
+
+        let client = self.client.as_ref().unwrap();
+
         // 性能计时：并行构建YES和NO订单开始
         let build_start = Instant::now();
-        
+
         // 并行构建YES和NO订单；仅 GTD 时设置 expiration（SDK 规定非 GTD 不可设过期）
         let (yes_order, no_order) = tokio::join!(
             async {
-                let b = self.client
+                let b = client
                     .limit_order()
                     .token_id(yes_token_id)
                     .side(Side::Buy)
@@ -232,7 +293,7 @@ impl TradingExecutor {
                 }
             },
             async {
-                let b = self.client
+                let b = client
                     .limit_order()
                     .token_id(no_token_id)
                     .side(Side::Buy)
@@ -260,8 +321,8 @@ impl TradingExecutor {
         
         // 并行签名YES和NO订单
         let (signed_yes_result, signed_no_result) = tokio::join!(
-            self.client.sign(&signer, yes_order),
-            self.client.sign(&signer, no_order)
+            client.sign(&signer, yes_order),
+            client.sign(&signer, no_order)
         );
         
         let signed_yes = signed_yes_result?;
@@ -278,7 +339,7 @@ impl TradingExecutor {
         } else {
             vec![signed_no, signed_yes]
         };
-        let results = match self.client.post_orders(orders_to_send).await {
+        let results = match client.post_orders(orders_to_send).await {
             Ok(results) => {
                 let send_elapsed = send_start.elapsed().as_millis();
                 let total_elapsed = total_start.elapsed().as_millis();

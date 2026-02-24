@@ -184,6 +184,15 @@ impl PositionTracker {
         (current_exposure + new_order_cost) > self.max_exposure
     }
 
+    /// 获取所有持仓（token_id -> 数量）
+    pub fn get_all_positions(&self) -> Vec<(U256, Decimal)> {
+        self.positions
+            .iter()
+            .filter(|entry| *entry.value() > dec!(0))
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect()
+    }
+
     /// 获取YES和NO的持仓
     pub fn get_pair_positions(&self, yes_token: U256, no_token: U256) -> (Decimal, Decimal) {
         (self.get_position(yes_token), self.get_position(no_token))

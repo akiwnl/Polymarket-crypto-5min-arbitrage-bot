@@ -31,7 +31,7 @@ pub struct HedgePosition {
 }
 
 pub struct HedgeMonitor {
-    client: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
     private_key: String,
     proxy_address: Option<Address>,
     positions: DashMap<String, HedgePosition>, // pair_id -> position
@@ -40,7 +40,7 @@ pub struct HedgeMonitor {
 
 impl HedgeMonitor {
     pub fn new(
-        client: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+        client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
         private_key: String,
         proxy_address: Option<Address>,
         position_tracker: Arc<PositionTracker>,
@@ -220,7 +220,13 @@ impl HedgeMonitor {
                 let pair_id_clone = pair_id.clone();
                 let position_tracker = self.position_tracker.clone();
                 let positions = self.positions.clone();
-                let client = self.client.clone();
+                let client = match self.client.as_ref() {
+                    Some(c) => c.clone(),
+                    None => {
+                        info!("[DRY RUN] 跳过对冲卖出 | 市场:{}", position.market_display);
+                        continue;
+                    }
+                };
                 let private_key = self.private_key.clone();
                 
                 // 先标记为正在处理，避免重复下单（使用remove+insert避免阻塞）
@@ -540,9 +546,11 @@ impl HedgeMonitor {
             order_size
         );
 
+        let client = self.client.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("[DRY RUN] 无法在 dry run 模式下执行卖出"))?;
+
         // 构建GTC卖出订单
-        let sell_order = self
-            .client
+        let sell_order = client
             .limit_order()
             .token_id(position.token_id)
             .side(Side::Sell)
@@ -553,10 +561,10 @@ impl HedgeMonitor {
             .await?;
 
         // 签名订单
-        let signed_order = self.client.sign(&signer, sell_order).await?;
+        let signed_order = client.sign(&signer, sell_order).await?;
 
         // 提交订单
-        let result = self.client.post_order(signed_order).await?;
+        let result = client.post_order(signed_order).await?;
 
         if !result.success {
             let error_msg = result.error_msg.as_deref().unwrap_or("未知错误");

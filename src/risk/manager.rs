@@ -38,7 +38,7 @@ pub struct OrderPair {
 }
 
 pub struct RiskManager {
-    clob_client: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    _clob_client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
     pending_pairs: DashMap<String, OrderPair>,
     position_tracker: std::sync::Arc<PositionTracker>,
     recovery_strategy: RecoveryStrategy,
@@ -46,11 +46,11 @@ pub struct RiskManager {
 
 impl RiskManager {
     pub fn new(
-        clob_client: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+        clob_client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
         config: &BotConfig,
     ) -> Self {
         Self {
-            clob_client,
+            _clob_client: clob_client,
             pending_pairs: DashMap::new(),
             position_tracker: std::sync::Arc::new(PositionTracker::new(
                 Decimal::try_from(config.risk_max_exposure_usdc).unwrap_or(dec!(1000.0)),

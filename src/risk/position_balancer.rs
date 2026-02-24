@@ -15,7 +15,7 @@ use poly_5min_bot::positions::get_positions;
 
 /// 仓位平衡器
 pub struct PositionBalancer {
-    clob_client: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    clob_client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
     position_tracker: std::sync::Arc<PositionTracker>,
     threshold: Decimal,
     min_total: Decimal,
@@ -24,7 +24,7 @@ pub struct PositionBalancer {
 
 impl PositionBalancer {
     pub fn new(
-        clob_client: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+        clob_client: Option<Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
         position_tracker: std::sync::Arc<PositionTracker>,
         config: &BotConfig,
     ) -> Self {
@@ -42,12 +42,19 @@ impl PositionBalancer {
         &self,
         market_map: &HashMap<B256, (U256, U256)>, // condition_id -> (yes_token_id, no_token_id)
     ) -> Result<()> {
+        let clob_client = match self.clob_client.as_ref() {
+            Some(c) => c,
+            None => {
+                debug!("[DRY RUN] 跳过仓位平衡检查");
+                return Ok(());
+            }
+        };
+
         // 获取所有活跃订单（处理分页）
         let mut all_orders = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = self
-                .clob_client
+            let page = clob_client
                 .orders(&OrdersRequest::default(), cursor)
                 .await?;
             
@@ -178,7 +185,7 @@ impl PositionBalancer {
                     // 取消YES订单
                     if cancel_yes_count > 0 {
                         let yes_order_ids: Vec<&str> = cancel_yes_order_ids.iter().map(|s| s.as_str()).collect();
-                        if let Err(e) = self.clob_client.cancel_orders(&yes_order_ids).await {
+                        if let Err(e) = self.clob_client.as_ref().unwrap().cancel_orders(&yes_order_ids).await {
                             error!(error = %e, "❌ 取消YES订单失败");
                         } else {
                             info!("✅ 已取消 {} 个YES订单", cancel_yes_count);
@@ -203,7 +210,7 @@ impl PositionBalancer {
                         
                         if !cancel_no_order_ids.is_empty() {
                             let cancel_no_order_ids_ref: Vec<&str> = cancel_no_order_ids.iter().map(|s| s.as_str()).collect();
-                            if let Err(e) = self.clob_client.cancel_orders(&cancel_no_order_ids_ref).await {
+                            if let Err(e) = self.clob_client.as_ref().unwrap().cancel_orders(&cancel_no_order_ids_ref).await {
                                 error!(error = %e, "取消NO订单失败");
                             } else {
                                 info!("已取消 {} 个NO订单（累计 {} 份）", cancel_no_order_ids.len(), accumulated_size);
@@ -231,7 +238,7 @@ impl PositionBalancer {
                     // 取消NO订单
                     if cancel_no_count > 0 {
                         let no_order_ids: Vec<&str> = cancel_no_order_ids.iter().map(|s| s.as_str()).collect();
-                        if let Err(e) = self.clob_client.cancel_orders(&no_order_ids).await {
+                        if let Err(e) = self.clob_client.as_ref().unwrap().cancel_orders(&no_order_ids).await {
                             error!(error = %e, "取消NO订单失败");
                         } else {
                             info!("已取消 {} 个NO订单", cancel_no_count);
@@ -256,7 +263,7 @@ impl PositionBalancer {
                         
                         if !cancel_yes_order_ids.is_empty() {
                             let cancel_yes_order_ids_ref: Vec<&str> = cancel_yes_order_ids.iter().map(|s| s.as_str()).collect();
-                            if let Err(e) = self.clob_client.cancel_orders(&cancel_yes_order_ids_ref).await {
+                            if let Err(e) = self.clob_client.as_ref().unwrap().cancel_orders(&cancel_yes_order_ids_ref).await {
                                 error!(error = %e, "❌ 取消YES订单失败");
                             } else {
                                 info!("✅ 已取消 {} 个YES订单（累计 {} 份）", cancel_yes_order_ids.len(), accumulated_size);
@@ -293,7 +300,7 @@ impl PositionBalancer {
                 info!("⚠️ YES挂单过多，取消 {} 个YES订单", cancel_order_ids.len());
 
                 let cancel_order_ids_ref: Vec<&str> = cancel_order_ids.iter().map(|s| s.as_str()).collect();
-                if let Err(e) = self.clob_client.cancel_orders(&cancel_order_ids_ref).await {
+                if let Err(e) = self.clob_client.as_ref().unwrap().cancel_orders(&cancel_order_ids_ref).await {
                     error!(error = %e, "❌ 取消YES订单失败");
                 } else {
                     info!("✅ 已取消 {} 个YES订单", cancel_order_ids.len());
@@ -321,7 +328,7 @@ impl PositionBalancer {
                 info!("NO挂单过多，取消 {} 个NO订单", cancel_order_ids.len());
 
                 let cancel_order_ids_ref: Vec<&str> = cancel_order_ids.iter().map(|s| s.as_str()).collect();
-                if let Err(e) = self.clob_client.cancel_orders(&cancel_order_ids_ref).await {
+                if let Err(e) = self.clob_client.as_ref().unwrap().cancel_orders(&cancel_order_ids_ref).await {
                     error!(error = %e, "取消NO订单失败");
                 } else {
                     info!("已取消 {} 个NO订单", cancel_order_ids.len());
