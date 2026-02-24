@@ -259,10 +259,12 @@ impl TradingExecutor {
                 order_size,
                 self.arbitrage_order_type
             );
+            let yes_order_id = format!("dry-run-yes-{}", &pair_id[..8]);
+            let no_order_id = format!("dry-run-no-{}", &pair_id[..8]);
             return Ok(OrderPairResult {
                 pair_id,
-                yes_order_id: format!("dry-run-yes-{}", &pair_id[..8]),
-                no_order_id: format!("dry-run-no-{}", &pair_id[..8]),
+                yes_order_id,
+                no_order_id,
                 yes_filled: order_size,
                 no_filled: order_size,
                 yes_size: order_size,
